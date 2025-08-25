@@ -1,5 +1,5 @@
-// Auth0 Service for Looper App - ENHANCED VERSION
-// Handles all authentication operations with improved error handling
+// Updated auth-service.js for GitHub Pages deployment
+// This version removes Electron-specific dependencies and focuses on web deployment
 
 let authService = null;
 
@@ -7,21 +7,26 @@ let authService = null;
 async function initializeAuth() {
     try {
         console.log('Initializing Auth0 with config:', AUTH_CONFIG);
-
-        authService = await auth0.createAuth0Client({
+        
+        // Create the Auth0 client configuration
+        const clientConfig = {
             domain: AUTH_CONFIG.domain,
             clientId: AUTH_CONFIG.clientId,
             authorizationParams: {
                 redirect_uri: AUTH_CONFIG.redirectUri,
-                audience: AUTH_CONFIG.audience,
                 scope: AUTH_CONFIG.scope
             },
             cacheLocation: 'localstorage',
             useRefreshTokens: true,
-            // Add error handling for network issues
             httpTimeoutInSeconds: 60
-        });
+        };
 
+        // Only add audience if it's defined and not empty
+        if (AUTH_CONFIG.audience && AUTH_CONFIG.audience.trim()) {
+            clientConfig.authorizationParams.audience = AUTH_CONFIG.audience;
+        }
+
+        authService = await auth0.createAuth0Client(clientConfig);
         console.log('Auth0 client initialized successfully');
         return authService;
     } catch (error) {
@@ -30,7 +35,7 @@ async function initializeAuth() {
     }
 }
 
-// Authentication service object
+// Authentication service methods
 const authServiceMethods = {
     // Check if user is authenticated
     async isAuthenticated() {
@@ -40,7 +45,9 @@ const authServiceMethods = {
         }
 
         try {
-            return await authService.isAuthenticated();
+            const result = await authService.isAuthenticated();
+            console.log('Authentication check result:', result);
+            return result;
         } catch (error) {
             console.error('Authentication check failed:', error);
             return false;
@@ -54,7 +61,9 @@ const authServiceMethods = {
         }
 
         try {
-            return await authService.getUser();
+            const user = await authService.getUser();
+            console.log('Retrieved user:', user);
+            return user;
         } catch (error) {
             console.error('Get user failed:', error);
             throw error;
@@ -68,7 +77,16 @@ const authServiceMethods = {
         }
 
         try {
-            return await authService.getTokenSilently();
+            const tokenOptions = {};
+            
+            // Only add audience if it's defined
+            if (AUTH_CONFIG.audience && AUTH_CONFIG.audience.trim()) {
+                tokenOptions.authorizationParams = {
+                    audience: AUTH_CONFIG.audience
+                };
+            }
+
+            return await authService.getTokenSilently(tokenOptions);
         } catch (error) {
             console.error('Error getting token silently:', error);
             throw error;
@@ -84,18 +102,14 @@ const authServiceMethods = {
         const defaultOptions = {
             authorizationParams: {
                 redirect_uri: AUTH_CONFIG.redirectUri,
-                scope: AUTH_CONFIG.scope,
-                audience: AUTH_CONFIG.audience
+                scope: AUTH_CONFIG.scope
             }
         };
 
-        // DEBUG: Log what we're sending to Auth0
-        console.log('Auth0 login config:', {
-            domain: AUTH_CONFIG.domain,
-            clientId: AUTH_CONFIG.clientId,
-            redirectUri: AUTH_CONFIG.redirectUri,
-            audience: AUTH_CONFIG.audience
-        });
+        // Only add audience if it's defined
+        if (AUTH_CONFIG.audience && AUTH_CONFIG.audience.trim()) {
+            defaultOptions.authorizationParams.audience = AUTH_CONFIG.audience;
+        }
 
         const mergedOptions = {
             ...defaultOptions,
@@ -106,7 +120,7 @@ const authServiceMethods = {
             }
         };
 
-        console.log('Final login options:', mergedOptions);
+        console.log('Login options:', mergedOptions);
 
         try {
             return await authService.loginWithRedirect(mergedOptions);
@@ -124,15 +138,18 @@ const authServiceMethods = {
 
         try {
             console.log('Processing redirect callback...');
+            console.log('Current URL:', window.location.href);
+            
             const result = await authService.handleRedirectCallback();
-
+            
             // Clear the URL parameters after successful authentication
             window.history.replaceState({}, document.title, window.location.pathname);
-
-            console.log('Redirect callback processed successfully');
+            
+            console.log('Redirect callback processed successfully:', result);
             return result;
         } catch (error) {
             console.error('Error handling redirect callback:', error);
+            console.error('Current URL parameters:', window.location.search);
             throw new Error(`Callback handling failed: ${error.message}`);
         }
     },
@@ -144,6 +161,7 @@ const authServiceMethods = {
         }
 
         try {
+            console.log('Logging out, redirect to:', AUTH_CONFIG.logoutUri);
             return authService.logout({
                 logoutParams: {
                     returnTo: AUTH_CONFIG.logoutUri
@@ -163,10 +181,17 @@ const authServiceMethods = {
             }
 
             const isAuthenticated = await this.isAuthenticated();
+            console.log('Auth requirement check - authenticated:', isAuthenticated);
+
             if (!isAuthenticated) {
                 // Check if we're in a callback scenario
                 const urlParams = new URLSearchParams(window.location.search);
-                if (urlParams.has('code') && urlParams.has('state')) {
+                const hasCode = urlParams.has('code');
+                const hasState = urlParams.has('state');
+                
+                console.log('URL parameters - code:', hasCode, 'state:', hasState);
+
+                if (hasCode && hasState) {
                     // We're in a callback, handle it
                     console.log('Callback detected, processing...');
                     await this.handleRedirectCallback();
@@ -182,6 +207,8 @@ const authServiceMethods = {
             return true;
         } catch (error) {
             console.error('Auth requirement check failed:', error);
+            // Show error before redirecting
+            alert('Authentication error: ' + error.message);
             window.location.href = 'login.html';
             return false;
         }
@@ -195,3 +222,5 @@ window.authService = authServiceMethods;
 Object.keys(authServiceMethods).forEach(method => {
     window[method] = authServiceMethods[method];
 });
+
+console.log('Auth service loaded successfully');
