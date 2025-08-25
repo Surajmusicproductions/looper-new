@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob: https://cdn.auth0.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.auth0.com https://*.auth0.com; style-src 'self' 'unsafe-inline' https://cdn.auth0.com https://*.auth0.com; font-src 'self' https://cdn.auth0.com https://*.auth0.com data:; img-src 'self' data: blob: https: http:; connect-src 'self' https://*.auth0.com wss: ws:; media-src 'self' blob: data:;">
+    <title>Authenticating - Looper Professional</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .callback-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background: linear-gradient(135deg, #191b22 0%, #23283a 100%);
+            text-align: center;
+            padding: 20px;
+        }
+        .callback-card {
+            background: rgba(36, 41, 58, 0.9);
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 400px;
+            width: 100%;
+            border: 2px solid rgba(34, 255, 232, 0.2);
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(34, 255, 232, 0.2);
+            border-top: 4px solid #22ffe8;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .status-message {
+            color: #f5f6fa;
+            font-size: 1.2em;
+            margin: 20px 0;
+        }
+        .error-message {
+            color: #ff4444;
+            background: rgba(255, 68, 68, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid rgba(255, 68, 68, 0.3);
+            display: none;
+        }
+        .retry-btn {
+            background: linear-gradient(90deg, #22ffe8 0%, #265cff 100%);
+            color: #ffffff;
+            border: none;
+            padding: 12px 30px;
+            font-size: 1.1em;
+            font-weight: bold;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(34, 255, 232, 0.3);
+            display: none;
+        }
+        .retry-btn:hover {
+            transform: translateY(-2px);
+            filter: brightness(1.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="callback-container">
+        <div class="callback-card">
+            <h2 style="color: #22ffe8; margin-bottom: 20px;">🎛️ Looper Professional</h2>
+
+            <div class="spinner" id="spinner"></div>
+
+            <div class="status-message" id="statusMessage">
+                Processing authentication...
+            </div>
+
+            <div class="error-message" id="errorMessage">
+                <!-- Error messages will appear here -->
+            </div>
+
+            <button class="retry-btn" id="retryBtn" onclick="retryAuth()">
+                Try Again
+            </button>
+        </div>
+    </div>
+
+    <!-- Auth0 SDK -->
+    <script src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
+    <script src="auth-config.js"></script>
+    <script src="auth-service.js"></script>
+
+    <script>
+        async function handleCallback() {
+            const statusMessage = document.getElementById('statusMessage');
+            const errorMessage = document.getElementById('errorMessage');
+            const spinner = document.getElementById('spinner');
+            const retryBtn = document.getElementById('retryBtn');
+
+            try {
+                statusMessage.textContent = 'Initializing authentication...';
+
+                // Initialize Auth0 client
+                await initializeAuth();
+
+                statusMessage.textContent = 'Processing callback...';
+
+                // Handle the callback
+                await authService.handleRedirectCallback();
+
+                statusMessage.textContent = 'Authentication successful! Redirecting...';
+
+                // Small delay to show success message
+                setTimeout(() => {
+                    window.location.href = 'app.html';
+                }, 1500);
+
+            } catch (error) {
+                console.error('Callback handling failed:', error);
+
+                // Hide spinner
+                spinner.style.display = 'none';
+
+                // Show error
+                statusMessage.textContent = 'Authentication failed';
+                errorMessage.textContent = `Error: ${error.message || 'Unknown error occurred'}`;
+                errorMessage.style.display = 'block';
+                retryBtn.style.display = 'inline-block';
+            }
+        }
+
+        function retryAuth() {
+            window.location.href = 'login.html';
+        }
+
+        // Start callback handling when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            // Check if we have callback parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            const hasCode = urlParams.has('code');
+            const hasState = urlParams.has('state');
+
+            if (hasCode && hasState) {
+                console.log('Callback parameters detected, processing...');
+                handleCallback();
+            } else {
+                console.log('No callback parameters found, redirecting to login...');
+                document.getElementById('statusMessage').textContent = 'No authentication data found';
+                document.getElementById('errorMessage').textContent = 'This page should only be accessed during the login process.';
+                document.getElementById('errorMessage').style.display = 'block';
+                document.getElementById('spinner').style.display = 'none';
+                document.getElementById('retryBtn').style.display = 'inline-block';
+            }
+        });
+    </script>
+</body>
+</html>

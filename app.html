@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob: https://cdn.auth0.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.auth0.com https://*.auth0.com; style-src 'self' 'unsafe-inline' https://cdn.auth0.com https://*.auth0.com; font-src 'self' https://cdn.auth0.com https://*.auth0.com data:; img-src 'self' data: blob: https: http:; connect-src 'self' https://*.auth0.com wss: ws:; media-src 'self' blob: data:;">
+    <title>Looper Professional</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- User Info Bar -->
+    <div style="background: rgba(26, 32, 44, 0.9); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(34, 255, 232, 0.2);">
+        <div style="color: #a0b3c7; font-size: 0.9em;">
+            Welcome, <span id="userName" style="color: #22ffe8; font-weight: bold;">User</span>
+        </div>
+        <button onclick="logout()" style="background: linear-gradient(90deg, #f43f5e 0%, #fbbf24 100%); color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.9em; font-weight: bold;">
+            🚪 Logout
+        </button>
+    </div>
+
+    <div id="startMsg" style="display:none;"></div>
+
+    <!-- Header -->
+    <div class="header">
+        <h1>🎛️ Looper Professional</h1>
+        <div id="bpmLabel">BPM: --</div>
+    </div>
+
+    <!-- Before FX Row -->
+    <div class="before-fx-row">
+        <button id="beforeFxReverb" class="before-fx-btn">Reverb</button>
+        <button id="beforeFxDelay" class="before-fx-btn">Delay</button>
+        <button id="beforeFxFlanger" class="before-fx-btn">Flanger</button>
+        <button id="beforeFxEq5" class="before-fx-btn">5-Band EQ</button>
+        <button id="beforeFxPitch" class="before-fx-btn">Pitch</button>
+    </div>
+
+    <!-- Pedal Board -->
+    <div class="pedal-board">
+        <!-- Track 1 -->
+        <div class="looper-pedal">
+            <div class="track-label">TRACK 1 (Master)</div>
+            <svg class="progress-ring" id="progressBar1">
+                <circle cx="46" cy="46" r="42" id="progressBar1"></circle>
+            </svg>
+            <div class="looper-icon" id="looperIcon1">▶</div>
+            <div class="looper-row">
+                <div class="state-display" id="stateDisplay1">Ready</div>
+            </div>
+            <div class="looper-vol-label">
+                Vol: <input type="range" id="volSlider1" class="looper-vol-slider" min="0" max="100" value="90">
+                <span id="volValue1">90%</span>
+            </div>
+            <div class="track-fx-labels" id="trackFxLabels1"></div>
+            <button class="main-looper-btn" id="mainLooperBtn1">Record/Play</button>
+            <button class="stop-btn" id="stopBtn1">Stop</button>
+            <button class="fx-menu-btn" id="fxMenuBtn1">After FX</button>
+        </div>
+
+        <!-- Track 2 -->
+        <div class="looper-pedal">
+            <div class="track-label">TRACK 2</div>
+            <svg class="progress-ring" id="progressBar2">
+                <circle cx="46" cy="46" r="42" id="progressBar2"></circle>
+            </svg>
+            <div class="looper-icon" id="looperIcon2">▶</div>
+            <div class="looper-row">
+                <div class="state-display" id="stateDisplay2">Ready</div>
+                <select id="divider2">
+                    <option value="1">1x</option>
+                    <option value="0.5">2x</option>
+                    <option value="2">1/2x</option>
+                    <option value="4">1/4x</option>
+                </select>
+            </div>
+            <div class="looper-vol-label">
+                Vol: <input type="range" id="volSlider2" class="looper-vol-slider" min="0" max="100" value="90">
+                <span id="volValue2">90%</span>
+            </div>
+            <div class="track-fx-labels" id="trackFxLabels2"></div>
+            <button class="main-looper-btn" id="mainLooperBtn2">Record/Play</button>
+            <button class="stop-btn" id="stopBtn2">Stop</button>
+            <button class="fx-menu-btn" id="fxMenuBtn2">After FX</button>
+        </div>
+
+        <!-- Track 3 -->
+        <div class="looper-pedal">
+            <div class="track-label">TRACK 3</div>
+            <svg class="progress-ring" id="progressBar3">
+                <circle cx="46" cy="46" r="42" id="progressBar3"></circle>
+            </svg>
+            <div class="looper-icon" id="looperIcon3">▶</div>
+            <div class="looper-row">
+                <div class="state-display" id="stateDisplay3">Ready</div>
+                <select id="divider3">
+                    <option value="1">1x</option>
+                    <option value="0.5">2x</option>
+                    <option value="2">1/2x</option>
+                    <option value="4">1/4x</option>
+                </select>
+            </div>
+            <div class="looper-vol-label">
+                Vol: <input type="range" id="volSlider3" class="looper-vol-slider" min="0" max="100" value="90">
+                <span id="volValue3">90%</span>
+            </div>
+            <div class="track-fx-labels" id="trackFxLabels3"></div>
+            <button class="main-looper-btn" id="mainLooperBtn3">Record/Play</button>
+            <button class="stop-btn" id="stopBtn3">Stop</button>
+            <button class="fx-menu-btn" id="fxMenuBtn3">After FX</button>
+        </div>
+
+        <!-- Track 4 -->
+        <div class="looper-pedal">
+            <div class="track-label">TRACK 4</div>
+            <svg class="progress-ring" id="progressBar4">
+                <circle cx="46" cy="46" r="42" id="progressBar4"></circle>
+            </svg>
+            <div class="looper-icon" id="looperIcon4">▶</div>
+            <div class="looper-row">
+                <div class="state-display" id="stateDisplay4">Ready</div>
+                <select id="divider4">
+                    <option value="1">1x</option>
+                    <option value="0.5">2x</option>
+                    <option value="2">1/2x</option>
+                    <option value="4">1/4x</option>
+                </select>
+            </div>
+            <div class="looper-vol-label">
+                Vol: <input type="range" id="volSlider4" class="looper-vol-slider" min="0" max="100" value="90">
+                <span id="volValue4">90%</span>
+            </div>
+            <div class="track-fx-labels" id="trackFxLabels4"></div>
+            <button class="main-looper-btn" id="mainLooperBtn4">Record/Play</button>
+            <button class="stop-btn" id="stopBtn4">Stop</button>
+            <button class="fx-menu-btn" id="fxMenuBtn4">After FX</button>
+        </div>
+    </div>
+
+    <!-- Live Monitor Button -->
+    <button class="monitor-btn" id="liveMicMonitor">🎤 Live Monitor: OFF</button>
+
+    <!-- Control Instructions -->
+    <div style="text-align: center; margin: 30px auto; max-width: 900px; color: #a0b3c7; font-size: 1.1em; background: rgba(36, 41, 58, 0.5); padding: 25px; border-radius: 15px; border: 1px solid rgba(34, 255, 232, 0.2);">
+        <h3 style="color: #22ffe8; margin-bottom: 20px;">🎹 Looper Professional Control Guide</h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; text-align: left;">
+            <div>
+                <h4 style="color: #f5f6fa; margin-bottom: 10px;">📋 Recording & Playback</h4>
+                <p>• Track 1 sets master tempo and BPM</p>
+                <p>• Other tracks sync automatically</p>
+                <p>• Click Record/Play or use hotkeys</p>
+                <p>• Overdub by clicking during playback</p>
+            </div>
+            <div>
+                <h4 style="color: #f5f6fa; margin-bottom: 10px;">⌨️ Keyboard Shortcuts</h4>
+                <p>• W/S - Track 1 Record/Stop</p>
+                <p>• E/D - Track 2 Record/Stop</p>
+                <p>• R/F - Track 3 Record/Stop</p>
+                <p>• T/G - Track 4 Record/Stop</p>
+            </div>
+            <div>
+                <h4 style="color: #f5f6fa; margin-bottom: 10px;">🎛️ Effects</h4>
+                <p>• Before-FX: Global input effects</p>
+                <p>• After-FX: Per-track effect chains</p>
+                <p>• Drag to reorder effects</p>
+                <p>• Bypass individual effects</p>
+            </div>
+            <div>
+                <h4 style="color: #f5f6fa; margin-bottom: 10px;">🎚️ Advanced Controls</h4>
+                <p>• Hold Stop (2s) to clear loop</p>
+                <p>• Live Monitor for input feedback</p>
+                <p>• Volume sliders per track</p>
+                <p>• Loop divisions (1x, 2x, 1/2x, 1/4x)</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Before FX Popup -->
+    <div id="fxBeforeParamsPopup" class="fx-popup hidden">
+        <div class="fx-popup-inner">
+            <div id="fxBeforeContent"><!-- Dynamic content --></div>
+        </div>
+    </div>
+
+    <!-- After FX Menu Popup -->
+    <div id="fxMenuPopup" class="fx-popup hidden">
+        <div class="fx-popup-inner">
+            <div id="fxMenuContent"><!-- Dynamic content --></div>
+        </div>
+    </div>
+
+    <!-- After FX Params Popup -->
+    <div id="fxParamsPopup" class="fx-popup hidden">
+        <div class="fx-popup-inner">
+            <div id="fxParamsContent"><!-- Dynamic content --></div>
+        </div>
+    </div>
+
+    <!-- Auth0 SDK -->
+    <script src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
+    <script src="auth-config.js"></script>
+    <script src="auth-service.js"></script>
+    <script src="script.js"></script>
+
+    <script>
+        // Authentication and user management
+        async function loadUserProfile() {
+            try {
+                await initializeAuth();
+                const isAuthenticated = await authService.isAuthenticated();
+
+                if (!isAuthenticated) {
+                    window.location.href = 'login.html';
+                    return;
+                }
+
+                const user = await authService.getUser();
+                if (user && user.name) {
+                    document.getElementById('userName').textContent = user.name || user.email || 'User';
+                }
+            } catch (error) {
+                console.error('Failed to load user profile:', error);
+                window.location.href = 'login.html';
+            }
+        }
+
+        async function logout() {
+            try {
+                await authService.logout();
+            } catch (error) {
+                console.error('Logout failed:', error);
+                // Force redirect to login
+                window.location.href = 'login.html';
+            }
+        }
+
+        // Initialize app
+        document.addEventListener('DOMContentLoaded', async function() {
+            try {
+                // Load user profile first
+                await loadUserProfile();
+
+                // Initialize audio context and looper functionality
+                console.log('Looper Professional initialized successfully');
+
+            } catch (error) {
+                console.error('App initialization failed:', error);
+                window.location.href = 'login.html';
+            }
+        });
+    </script>
+</body>
+</html>
