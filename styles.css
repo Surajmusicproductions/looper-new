@@ -6,6 +6,18 @@ body {
   padding: 0;
 }
 
+.pedal-board::-webkit-scrollbar {
+  height: 10px;                 /* make scrollbar bigger */
+}
+.pedal-board::-webkit-scrollbar-thumb {
+  background: #38bdf8;
+  border-radius: 6px;
+}
+.pedal-board::-webkit-scrollbar-track {
+  background: #1a1a1a;
+}
+
+
 /* ===== HEADER ===== */
 .header {
   display: flex;
@@ -360,6 +372,7 @@ select {
 ::-webkit-scrollbar-thumb { background: #384080; border-radius: 8px; }
 
 .hidden { display: none !important; }
+
 
 
 
