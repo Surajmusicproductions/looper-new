@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Looper Pedal Board (RC-505 Inspired)</title>
+  <link rel="stylesheet" href="styles.css" />
+  
+  <!-- AdSense script -->
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5653516284156200"
+    crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="startMsg" style="display:none;"></div>
+ <div class="header">
+  <h1>Looper Pedal Board</h1>
+  <span id="bpmLabel">BPM: --</span>
+
+  <!-- NEW zoom slider -->
+  <div class="zoom-control" style="margin-top:8px; text-align:center;">
+    <label for="zoomSlider" style="font-size:0.9em;">Zoom:</label>
+    <input type="range" id="zoomSlider" min="70" max="110" value="92" />
+  </div>
+</div>
+
+
+  <!-- BEFORE FX ROW: 5 effect ON/OFF buttons -->
+  <div class="before-fx-row">
+    <button class="before-fx-btn" id="fxBeforeBtn_delay">Delay</button>
+    <button class="before-fx-btn" id="fxBeforeBtn_reverb">Reverb</button>
+    <button class="before-fx-btn" id="fxBeforeBtn_pitch">Pitch Shift</button>
+    <button class="before-fx-btn" id="fxBeforeBtn_flanger">Flanger</button>
+    <button class="before-fx-btn" id="fxBeforeBtn_eq5">EQ (5 Band)</button>
+  </div>
+
+  <!-- PEDAL BOARD: 4 loopers with FX label + FX menu -->
+  <div class="pedal-board">
+    <!-- Looper 1: Master -->
+    <div class="looper-pedal" id="looper1">
+      <div class="track-label">MASTER</div>
+      <svg class="progress-ring" width="92" height="92">
+        <circle id="progressBar1" r="42" cx="46" cy="46" stroke-width="6" fill="none" />
+      </svg>
+      <div class="looper-icon" id="looperIcon1">▶</div>
+      <div class="looper-row">
+        <div class="state-display" id="stateDisplay1">Ready</div>
+      </div>
+      <label class="looper-vol-label">
+        <span>Vol:</span>
+        <input type="range" class="looper-vol-slider" id="volSlider1" min="0" max="120" value="90" />
+        <span id="volValue1">90%</span>
+      </label>
+      <div class="track-fx-labels" id="trackFxLabels1"></div>
+      <button class="main-looper-btn" id="mainLooperBtn1">Record/Overdub</button>
+      <button class="stop-btn" id="stopBtn1">Stop/Clear</button>
+      <button class="fx-menu-btn" id="fxMenuBtn1">🎛 FX Menu</button>
+    </div>
+    <!-- Looper 2 -->
+    <div class="looper-pedal" id="looper2">
+      <div class="track-label">TRACK 2</div>
+      <svg class="progress-ring" width="92" height="92">
+        <circle id="progressBar2" r="42" cx="46" cy="46" stroke-width="6" fill="none" />
+      </svg>
+      <div class="looper-icon" id="looperIcon2">▶</div>
+      <div class="looper-row">
+        <div class="state-display" id="stateDisplay2">Ready</div>
+      </div>
+      <label class="looper-vol-label">
+        <span>Vol:</span>
+        <input type="range" class="looper-vol-slider" id="volSlider2" min="0" max="120" value="90" />
+        <span id="volValue2">90%</span>
+      </label>
+      <div class="track-fx-labels" id="trackFxLabels2"></div>
+      <label>Divide:
+        <select id="divider2">
+          <option value="1">x1</option>
+          <option value="0.5">x½</option>
+          <option value="2">x2</option>
+        </select>
+      </label>
+      <button class="main-looper-btn" id="mainLooperBtn2">Record/Overdub</button>
+      <button class="stop-btn" id="stopBtn2">Stop/Clear</button>
+      <button class="fx-menu-btn" id="fxMenuBtn2">🎛 FX Menu</button>
+    </div>
+    <!-- Looper 3 -->
+    <div class="looper-pedal" id="looper3">
+      <div class="track-label">TRACK 3</div>
+      <svg class="progress-ring" width="92" height="92">
+        <circle id="progressBar3" r="42" cx="46" cy="46" stroke-width="6" fill="none" />
+      </svg>
+      <div class="looper-icon" id="looperIcon3">▶</div>
+      <div class="looper-row">
+        <div class="state-display" id="stateDisplay3">Ready</div>
+      </div>
+      <label class="looper-vol-label">
+        <span>Vol:</span>
+        <input type="range" class="looper-vol-slider" id="volSlider3" min="0" max="120" value="90" />
+        <span id="volValue3">90%</span>
+      </label>
+      <div class="track-fx-labels" id="trackFxLabels3"></div>
+      <label>Divide:
+        <select id="divider3">
+          <option value="1">x1</option>
+          <option value="0.5">x½</option>
+          <option value="2">x2</option>
+        </select>
+      </label>
+      <button class="main-looper-btn" id="mainLooperBtn3">Record/Overdub</button>
+      <button class="stop-btn" id="stopBtn3">Stop/Clear</button>
+      <button class="fx-menu-btn" id="fxMenuBtn3">🎛 FX Menu</button>
+    </div>
+    <!-- Looper 4 -->
+    <div class="looper-pedal" id="looper4">
+      <div class="track-label">TRACK 4</div>
+      <svg class="progress-ring" width="92" height="92">
+        <circle id="progressBar4" r="42" cx="46" cy="46" stroke-width="6" fill="none" />
+      </svg>
+      <div class="looper-icon" id="looperIcon4">▶</div>
+      <div class="looper-row">
+        <div class="state-display" id="stateDisplay4">Ready</div>
+      </div>
+      <label class="looper-vol-label">
+        <span>Vol:</span>
+        <input type="range" class="looper-vol-slider" id="volSlider4" min="0" max="120" value="90" />
+        <span id="volValue4">90%</span>
+      </label>
+      <div class="track-fx-labels" id="trackFxLabels4"></div>
+      <label>Divide:
+        <select id="divider4">
+          <option value="1">x1</option>
+          <option value="0.5">x½</option>
+          <option value="2">x2</option>
+        </select>
+      </label>
+      <button class="main-looper-btn" id="mainLooperBtn4">Record/Overdub</button>
+      <button class="stop-btn" id="stopBtn4">Stop/Clear</button>
+      <button class="fx-menu-btn" id="fxMenuBtn4">🎛 FX Menu</button>
+    </div>
+  </div>
+
+  <!-- LIVE MIC FX BUTTON -->
+  <button id="monitorBtn" class="monitor-btn">Live MIC OFF</button>
+
+  <!-- Popups for After FX (dynamically generated) -->
+  <div id="fxMenuPopup" class="fx-popup hidden"></div>
+  <div id="fxParamsPopup" class="fx-popup hidden"></div>
+  <div id="fxBeforeParamsPopup" class="fx-popup hidden"></div>
+
+  <!-- Footer: Open App and Source links -->
+  <footer style="text-align:center; margin: 22px 0 8px 0;">
+    <a href="https://loopstation-pro.netlify.app/" target="_blank" class="open-link-btn">
+      🔗 Open Looper App (Mobile)
+    </a>
+    <br>
+    <a href="https://https://loopstation-pro.netlify.app/" target="_blank" class="footer-link">open new looper</a>
+  </footer>
+  <!-- Load the fixed script -->
+  <script src="script.js"></script>
+</body>
+</html>
