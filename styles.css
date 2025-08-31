@@ -74,10 +74,11 @@ body {
   margin: 26px auto 10px auto;
   max-width: 1400px;
 
-  /* NEW: fix overlap + allow zoom/scroll */
-  transform: scale(0.92);
-  transform-origin: top center;
-  overflow-x: auto;
+  /* REMOVE old scaling here */
+  /* transform: scale(0.92);
+     transform-origin: top center; */
+
+  overflow-x: auto;       /* allow scrolling if needed */
   padding-bottom: 12px;
 }
 
@@ -362,3 +363,4 @@ select {
 ::-webkit-scrollbar-thumb { background: #384080; border-radius: 8px; }
 
 .hidden { display: none !important; }
+
