@@ -1,292 +1,3 @@
-// ======= SUPABASE AUTH + ENTITLEMENTS =======
-let supabase = null;
-let isAuthed = false;
-
-// Lock/unlock UI based on auth
-function applyAuthGate() {
-  const btns = document.querySelectorAll(
-    '.main-looper-btn, .stop-btn, .fx-menu-btn, .before-fx-row .before-fx-btn, #monitorBtn'
-  );
-  btns.forEach(b => { if (b) b.disabled = !isAuthed; });
-
-  if (window.loopers && loopers.length) {
-    for (let i = 1; i <= 4; i++) {
-      if (!loopers[i]) continue;
-      loopers[i].disable(!isAuthed || (i >= 2 && !masterIsSet));
-    }
-  }
-
-  const g = document.getElementById('authGate');
-  if (g) g.classList.toggle('hidden', isAuthed);
-
-  // Hide “Go Premium” button entirely if already premium
-  const premiumBtn = document.getElementById('openPremiumModal');
-  const isPremium = document.body.dataset.premium === "1";
-  if (premiumBtn) premiumBtn.classList.toggle('hidden', !isAuthed || isPremium);
-}
-
-async function initAuth() {
-  supabase = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
-
-  const loginBtn = document.getElementById("loginBtn");
-  const logoutBtn = document.getElementById("logoutBtn");
-  const signupBtn = document.getElementById("signupBtn");
-  const userBadge = document.getElementById("userBadge");
-
-  async function refreshHeader() {
-    const { data: { user } } = await supabase.auth.getUser();
-    isAuthed = !!user;
-    applyAuthGate();
-
-    if (isAuthed) {
-      loginBtn?.classList.add("hidden");
-      logoutBtn?.classList.remove("hidden");
-      userBadge?.classList.remove("hidden");
-      if (userBadge) userBadge.textContent = user?.email || "Signed in";
-      await refreshEntitlementUI();
-    } else {
-      loginBtn?.classList.remove("hidden");
-      logoutBtn?.classList.add("hidden");
-      userBadge?.classList.add("hidden");
-      if (userBadge) userBadge.textContent = "";
-      document.body.dataset.premium = "0";
-    }
-  }
-
-  supabase.auth.onAuthStateChange(() => refreshHeader());
-  await refreshHeader();
-
-  // Login handler
-  loginBtn?.addEventListener("click", async () => {
-    const email = prompt("Enter email:");
-    const pass = prompt("Enter password:");
-    if (!email || !pass) return;
-
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password: pass,
-    });
-    if (error) alert(error.message);
-  });
-
-  // Sign-up handler with post-confirmation redirect
-  signupBtn?.addEventListener("click", async () => {
-    const email = prompt("Enter email:");
-    const pass = prompt("Enter password:");
-    if (!email || !pass) return;
-
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password: pass,
-      options: {
-        emailRedirectTo: "https://loopstation-pro.netlify.app/", // ← Your actual deployed URL
-      },
-    });
-
-    if (error) {
-      alert(error.message);
-    } else {
-      alert("✅ Account created! Please check your email and click the confirmation link.");
-    }
-  });
-
-
-  // Logout handler
-  logoutBtn?.addEventListener("click", async () => {
-    isAuthed = false;
-    applyAuthGate();
-    await supabase.auth.signOut();
-  });
-}
-
-// Require auth before continuing (returns true if signed in)
-async function requireAuth() {
-  if (!supabase) await initAuth();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    alert("Please log in to continue");
-    return false;
-  }
-  return true;
-}
-
-// ===== ENTITLEMENT (premium/ad) UI =====
-async function refreshEntitlementUI() {
-  const { data: { user } } = await supabase.auth.getUser();
-  const badge  = document.getElementById("ad-minutes-left");
-
-  if (!user) { document.body.dataset.premium = "0"; applyAuthGate(); return; }
-
-  let hasSub = false, adSecs = 0;
-  try {
-    // If you created v_user_entitlement in Supabase as shown earlier
-    const { data, error } = await supabase
-      .from("v_user_entitlement")
-      .select("*")
-      .eq("user_id", user.id)
-      .single();
-    if (!error && data) { hasSub = !!data.has_sub; adSecs = data.ad_seconds_left || 0; }
-  } catch (_) {}
-
-  const premium = hasSub || adSecs > 0;
-  document.body.dataset.premium = premium ? "1" : "0";
-  applyAuthGate();
-
-  // Countdown UI for ad minutes
-  if (!hasSub && adSecs > 0 && badge) {
-    const start = Date.now();
-    const t = setInterval(async () => {
-      const left = Math.max(0, adSecs - Math.floor((Date.now() - start) / 1000));
-      badge.textContent = Math.ceil(left / 60) + " min left";
-      if (left <= 0) { clearInterval(t); await consumeAllCredits(); await refreshEntitlementUI(); }
-    }, 1000);
-  } else if (badge) {
-    badge.textContent = "";
-  }
-}
-
-// Rewarded ad credit
-async function grantAdCredit(seconds = 300) {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) { alert("Please log in first"); return; }
-  const expires = new Date(Date.now() + 6 * 60 * 1000).toISOString();
-  const { error } = await supabase.from("ad_passes").insert({
-    user_id: user.id,
-    seconds_remaining: seconds,
-    expires_at: expires
-  });
-  if (error) alert(error.message);
-}
-
-async function consumeAllCredits() {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return;
-  await supabase.from("ad_passes").update({ seconds_remaining: 0 }).eq("user_id", user.id).gt("seconds_remaining", 0);
-}
-
-// Run init
-if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", initAuth);
-} else {
-  initAuth();
-}
-
-// ===== End AUTH0 block =====
-
-// —— Premium modal controls ——
-(function premiumModalWiring(){
-  const openBtn   = document.getElementById('openPremiumModal');
-  const modal     = document.getElementById('premiumModal');
-  const overlay   = document.getElementById('premiumModalOverlay');
-  const closeBtn  = document.getElementById('premiumModalClose');
-
-  function openModal() {
-    if (window.refreshEntitlementUI) refreshEntitlementUI();
-    overlay.classList.remove('hidden');
-    modal.classList.remove('hidden');
-    document.body.classList.add('modal-open');   // lock background scroll
-  }
-
-  function closeModal() {
-    overlay.classList.add('hidden');
-    modal.classList.add('hidden');
-    document.body.classList.remove('modal-open'); // unlock background scroll
-  }
-
-  openBtn?.addEventListener('click', openModal);
-  closeBtn?.addEventListener('click', closeModal);
-  overlay?.addEventListener('click', closeModal);
-  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
-})();
-
-
-/* ===========================
-   Premium payments + watch-ad
-   Paste this right AFTER the premiumModalWiring() IIFE
-   =========================== */
-
-(function premiumPurchaseWiring(){
-  const watchAdBtn = document.getElementById('watchAdBtn');
-  const buyDaily   = document.getElementById('buy-daily');
-  const buyMonthly = document.getElementById('buy-monthly');
-  const buyYearly  = document.getElementById('buy-yearly');
-
-  // helper: require logged in user (uses your existing requireAuth())
-  async function requireUserOrAlert(){
-    const ok = await requireAuth();
-    if (!ok) { alert('Please login first'); return null; }
-    const { data: { user } } = await supabase.auth.getUser();
-    return user;
-  }
-
-  // --- Watch ad (simple placeholder flow) ---
-  watchAdBtn?.addEventListener('click', async ()=>{
-    const user = await requireUserOrAlert();
-    if (!user) return;
-    // Replace this with real ad SDK flow when ready. For now: confirm then grant.
-    if (!confirm('Simulate watching a rewarded ad for 5 minutes?')) return;
-    await grantAdCredit(300);            // grant 5 minutes (300s)
-    await refreshEntitlementUI();        // update UI
-    alert('Unlocked for 5 minutes (ad simulated).');
-  });
-
-  // --- Buy handlers (calls /create_order on your server/edge function) ---
-  async function startCheckout(planKey){
-    const user = await requireUserOrAlert();
-    if (!user) return;
-
-    // map planKey to price + label (server should honor these)
-    const plans = {
-      daily:   { amount: 20*100, currency: 'INR', label: 'Daily' },
-      monthly: { amount: 299*100, currency: 'INR', label: 'Monthly' },
-      yearly:  { amount: 1199*100, currency: 'INR', label: 'Yearly' }
-    };
-    const plan = plans[planKey];
-    if (!plan) return alert('Unknown plan');
-
-    // call your server / Supabase Edge Function to create Razorpay order
-    // server returns { success:true, order: { id, amount, currency } }
-    const resp = await fetch('/create_order', {
-      method: 'POST',
-      headers: { 'content-type':'application/json' },
-      body: JSON.stringify({ plan: planKey })
-    });
-    const data = await resp.json();
-    if (!data || !data.order) return alert('Failed to create order: '+(data?.error||'unknown'));
-
-    const order = data.order;
-    const rzp = new window.Razorpay({
-      key: window.RAZORPAY_KEY_ID,
-      order_id: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      name: 'Looper Premium',
-      description: plan.label,
-      handler: async function (payload){
-        // On success, let server verify payment & grant entitlement
-        const verifyResp = await fetch('/verify_payment', {
-          method: 'POST', headers: {'content-type':'application/json'},
-          body: JSON.stringify({ razorpay_order_id: order.id, razorpay_payment_id: payload.razorpay_payment_id, razorpay_signature: payload.razorpay_signature })
-        });
-        const v = await verifyResp.json();
-        if (v?.success) {
-          alert('Payment successful — premium activated');
-          await refreshEntitlementUI();
-          document.getElementById('premiumModalClose')?.click();
-        } else {
-          alert('Payment verification failed');
-        }
-      },
-      theme: { color: '#264fff' }
-    });
-    rzp.open();
-  }
-
-  buyDaily?.addEventListener('click', ()=>startCheckout('daily'));
-  buyMonthly?.addEventListener('click', ()=>startCheckout('monthly'));
-  buyYearly?.addEventListener('click', ()=>startCheckout('yearly'));
-})();
-
 /* Looper Pedal Board – Popups + Programmable FX Chains (Before + After)
    - Before-FX: popup with per-effect parameters
    - After-FX: menu popup to add/remove/reorder effects (series), second popup to tweak parameters
@@ -379,9 +90,6 @@ function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ?
 
 // ======= AUDIO SETUP =======
 async function ensureMic(){
-  // 🔐 Require login before enabling microphone
-  if (!(await requireAuth())) return;
-
   if (micStream) return;
   if (!navigator.mediaDevices?.getUserMedia) { showMsg('❌ Microphone not supported'); throw new Error('gUM'); }
   try {
@@ -653,207 +361,114 @@ class Looper {
     }
 
     // ===== After-FX chain state =====
-  this.pitchSemitones = 0;                    // “Pitch (PlaybackRate)” effect uses this
-  this.fx = { chain: [], nextId: 1 };         // array of {id,type,name,params,bypass,nodes}
+    this.pitchSemitones = 0;                    // “Pitch (PlaybackRate)” effect uses this
+    this.fx = { chain: [], nextId: 1 };         // array of {id,type,name,params,bypass,nodes}
 
-  this.updateUI();
-  this.setRing(0);
+    this.updateUI(); this.setRing(0);
+    if (index>=2 && dividerSelectors[index]){
+      this.divider = parseFloat(dividerSelectors[index].value);
+      dividerSelectors[index].addEventListener('change', e=>{ this.divider=parseFloat(e.target.value); });
+      this.disable(true);
+    }
 
-  if (index>=2 && dividerSelectors[index]){
-    this.divider = parseFloat(dividerSelectors[index].value);
-    dividerSelectors[index].addEventListener('change', e=>{
-      this.divider=parseFloat(e.target.value);
-    });
-    this.disable(true);
-  }
-
-  addHold(this.stopBtn,
-    ()=>{
-      if (this.state==='ready') return;
-      this.holdTimer=setTimeout(()=>{
-        this.clearLoop();
-        this.holdTimer=null;
-      },2000);
-    },
-    ()=>{
-      if (this.holdTimer){
-        clearTimeout(this.holdTimer);
-        this.holdTimer=null;
-        if (this.state==='playing'||this.state==='overdub') this.stopPlayback();
-        else if (this.state==='stopped') this.resumePlayback();
-        else if (this.state==='recording') this.abortRecording();
+    addHold(this.stopBtn,
+      ()=>{ if (this.state==='ready') return; this.holdTimer=setTimeout(()=>{ this.clearLoop(); this.holdTimer=null; },2000); },
+      ()=>{ if (this.holdTimer){ clearTimeout(this.holdTimer); this.holdTimer=null;
+          if (this.state==='playing'||this.state==='overdub') this.stopPlayback();
+          else if (this.state==='stopped') this.resumePlayback();
+          else if (this.state==='recording') this.abortRecording();
+        }
       }
+    );
+    addTap(this.mainBtn, async ()=>{ await ensureMic(); await this.handleMainBtn(); });
+
+    const fxBtn = $('#fxMenuBtn'+index);
+    if (fxBtn) fxBtn.addEventListener('click', ()=> openTrackFxMenu(this.index));
+  }
+
+  setLED(color){ const map={green:'#22c55e', red:'#e11d48', orange:'#f59e0b', gray:'#6b7280'}; this.ledRing.style.stroke=map[color]||'#fff'; this.ledRing.style.filter=(color==='gray'?'none':'drop-shadow(0 0 8px '+(map[color]+'88')+')'); }
+  setRing(r){ const R=42,C=2*Math.PI*R; this.ledRing.style.strokeDasharray=C; this.ledRing.style.strokeDashoffset=C*(1-r); }
+  setIcon(s,c){ this.looperIcon.textContent=s; if(c) this.looperIcon.style.color=c; }
+  setDisplay(t){ this.stateDisplay.textContent=t; }
+  updateUI(){
+    switch(this.state){
+      case 'ready': this.setLED('green'); this.setRing(0); this.setIcon('▶'); this.setDisplay('Ready'); break;
+      case 'recording': this.setLED('red'); this.setIcon('⦿','#e11d48'); this.setDisplay('Recording...'); break;
+      case 'playing': this.setLED('green'); this.setIcon('▶'); this.setDisplay('Playing'); break;
+      case 'overdub': this.setLED('orange'); this.setIcon('⦿','#f59e0b'); this.setDisplay('Overdubbing'); break;
+      case 'stopped': this.setLED('gray'); this.setRing(0); this.setIcon('▶','#aaa'); this.setDisplay('Stopped'); break;
+      case 'waiting': this.setLED('gray'); this.setRing(0); this.setIcon('⏳','#aaa'); this.setDisplay('Waiting...'); break;
     }
-  );
-
-  addTap(this.mainBtn, async ()=>{
-    await ensureMic();
-    await this.handleMainBtn();
-  });
-
-  const fxBtn = $('#fxMenuBtn'+index);
-  if (fxBtn) fxBtn.addEventListener('click', ()=> openTrackFxMenu(this.index));
-}
-
-setLED(color){
-  const map={green:'#22c55e', red:'#e11d48', orange:'#f59e0b', gray:'#6b7280'};
-  this.ledRing.style.stroke=map[color]||'#fff';
-  this.ledRing.style.filter=(color==='gray'
-    ?'none'
-    :'drop-shadow(0 0 8px '+(map[color]+'88')+')');
-}
-
-setRing(r){
-  const R=42,C=2*Math.PI*R;
-  this.ledRing.style.strokeDasharray=C;
-  this.ledRing.style.strokeDashoffset=C*(1-r);
-}
-
-setIcon(s,c){
-  this.looperIcon.textContent=s;
-  if(c) this.looperIcon.style.color=c;
-}
-
-setDisplay(t){
-  this.stateDisplay.textContent=t;
-}
-
-updateUI(){
-  switch(this.state){
-    case 'ready': this.setLED('green'); this.setRing(0); this.setIcon('▶'); this.setDisplay('Ready'); break;
-    case 'recording': this.setLED('red'); this.setIcon('⦿','#e11d48'); this.setDisplay('Recording...'); break;
-    case 'playing': this.setLED('green'); this.setIcon('▶'); this.setDisplay('Playing'); break;
-    case 'overdub': this.setLED('orange'); this.setIcon('⦿','#f59e0b'); this.setDisplay('Overdubbing'); break;
-    case 'stopped': this.setLED('gray'); this.setRing(0); this.setIcon('▶','#aaa'); this.setDisplay('Stopped'); break;
-    case 'waiting': this.setLED('gray'); this.setRing(0); this.setIcon('⏳','#aaa'); this.setDisplay('Waiting...'); break;
-  }
-  if (this.uiDisabled){
-    this.mainBtn.disabled=true;
-    this.stopBtn.disabled=true;
-    this.mainBtn.classList.add('disabled-btn');
-    this.stopBtn.classList.add('disabled-btn');
-    this.setDisplay('WAIT: Set Track 1');
-  } else {
-    this.mainBtn.disabled=false;
-    this.stopBtn.disabled=false;
-    this.mainBtn.classList.remove('disabled-btn');
-    this.stopBtn.classList.remove('disabled-btn');
-  }
-}
-
-disable(v){
-  this.uiDisabled=v;
-  this.updateUI();
-}
-
-async handleMainBtn(){
-  if (this.state==='ready') await this.phaseLockedRecord();
-  else if (this.state==='recording') await this.stopRecordingAndPlay();
-  else if (this.state==='playing') this.armOverdub();
-  else if (this.state==='overdub') this.finishOverdub();
-}
-
-async phaseLockedRecord(){
-  if (!processedStream) await ensureMic();
-  if (this.index===1 || !masterIsSet){
-    await this.startRecording();
-    return;
-  }
-  this.state='waiting';
-  this.updateUI();
-  const now = audioCtx.currentTime, master = loopers[1];
-  const elapsed = (now - master.loopStartTime) % masterLoopDuration;
-  const toNext = masterLoopDuration - elapsed;
-  setTimeout(()=>{
-    this._startPhaseLockedRecording(masterLoopDuration*this.divider);
-  }, toNext*1000);
-}
-
-async _startPhaseLockedRecording(len){
-  this.state='recording';
-  this.updateUI();
-  this.chunks=[];
-  this.mediaRecorder=new MediaRecorder(processedStream);
-  this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-  this.mediaRecorder.start();
-  const start=Date.now(), self=this;
-  (function anim(){
-    if (self.state==='recording'){
-      const pct=(Date.now()-start)/(len*1000);
-      self.setRing(Math.min(pct,1));
-      if (pct<1) requestAnimationFrame(anim);
-      if (pct>=1) self.stopRecordingAndPlay();
+    if (this.uiDisabled){
+      this.mainBtn.disabled=true; this.stopBtn.disabled=true; this.mainBtn.classList.add('disabled-btn'); this.stopBtn.classList.add('disabled-btn'); this.setDisplay('WAIT: Set Track 1');
+    } else {
+      this.mainBtn.disabled=false; this.stopBtn.disabled=false; this.mainBtn.classList.remove('disabled-btn'); this.stopBtn.classList.remove('disabled-btn');
     }
-  })();
-  setTimeout(()=>{
-    if (this.state==='recording') self.stopRecordingAndPlay();
-  }, len*1000);
-}
-
-async startRecording(){
-  if (!processedStream) await ensureMic();
-  if (this.index>=2 && !masterIsSet) return;
-  this.state='recording';
-  this.updateUI();
-  this.chunks=[];
-  this.mediaRecorder=new MediaRecorder(processedStream);
-  this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-  this.mediaRecorder.start();
-  const start=Date.now(), self=this;
-  const max=(this.index===1)
-    ?60000
-    :(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
-  (function anim(){
-    if (self.state==='recording'){
-      const pct=(Date.now()-start)/max;
-      self.setRing(Math.min(pct,1));
-      if (pct<1) requestAnimationFrame(anim);
-      if (pct>=1) self.stopRecordingAndPlay();
-    }
-  })();
-}
-
-async stopRecordingAndPlay(){
-  if (!this.mediaRecorder) return;
-  this.state='playing';
-  this.updateUI();
-  this.mediaRecorder.onstop = async ()=>{
-    const blob=new Blob(this.chunks,{type:'audio/webm'});
-    const buf=await blob.arrayBuffer();
-    audioCtx.decodeAudioData(buf, buffer=>{
-      this.loopBuffer=buffer;
-      this.loopDuration=buffer.duration;
-      if (this.index===1){
-        masterLoopDuration=this.loopDuration;
-        masterBPM = Math.round((60/this.loopDuration)*4);
-        updateDelayFromTempo(); // 🔔 sync delay with new BPM
-        masterIsSet=true;
-        bpmLabel.textContent = `BPM: ${masterBPM}`;
-        for (let k=2;k<=4;k++) loopers[k].disable(false);
-      }
-      this.startPlayback();
-    });
-  };
-  this.mediaRecorder.stop();
-}
-
-abortRecording(){
-  if (this.mediaRecorder && this.state==='recording'){
-    try{
-      this.mediaRecorder.ondataavailable=null;
-      this.mediaRecorder.stop();
-    }catch{}
-    this.mediaRecorder=null;
-    this.chunks=[];
-    this.state='ready';
-    this.loopBuffer=null;
-    this.loopDuration=0;
-    this.setRing(0);
-    this.updateUI();
   }
-}
+  disable(v){ this.uiDisabled=v; this.updateUI(); }
 
-// ===== After-FX CHAIN WIRING =====
+  async handleMainBtn(){
+    if (this.state==='ready') await this.phaseLockedRecord();
+    else if (this.state==='recording') await this.stopRecordingAndPlay();
+    else if (this.state==='playing') this.armOverdub();
+    else if (this.state==='overdub') this.finishOverdub();
+  }
+
+  async phaseLockedRecord(){
+    if (!processedStream) await ensureMic();
+    if (this.index===1 || !masterIsSet){ await this.startRecording(); return; }
+    this.state='waiting'; this.updateUI();
+    const now = audioCtx.currentTime, master = loopers[1];
+    const elapsed = (now - master.loopStartTime) % masterLoopDuration;
+    const toNext = masterLoopDuration - elapsed;
+    setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
+  }
+  async _startPhaseLockedRecording(len){
+    this.state='recording'; this.updateUI();
+    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
+    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
+    this.mediaRecorder.start();
+    const start=Date.now(), self=this;
+    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/(len*1000); self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
+    setTimeout(()=>{ if (this.state==='recording') self.stopRecordingAndPlay(); }, len*1000);
+  }
+  async startRecording(){
+    if (!processedStream) await ensureMic();
+    if (this.index>=2 && !masterIsSet) return;
+    this.state='recording'; this.updateUI();
+    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
+    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
+    this.mediaRecorder.start();
+    const start=Date.now(), self=this; const max=(this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
+    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/max; self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
+  }
+    async stopRecordingAndPlay(){
+    if (!this.mediaRecorder) return;
+    this.state='playing'; this.updateUI();
+    this.mediaRecorder.onstop = async ()=>{
+      const blob=new Blob(this.chunks,{type:'audio/webm'}); const buf=await blob.arrayBuffer();
+      audioCtx.decodeAudioData(buf, buffer=>{
+        this.loopBuffer=buffer; this.loopDuration=buffer.duration;
+        if (this.index===1){
+          masterLoopDuration=this.loopDuration;
+          masterBPM = Math.round((60/this.loopDuration)*4);
+          updateDelayFromTempo(); // ADD THIS LINE
+          masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
+          for (let k=2;k<=4;k++) loopers[k].disable(false);
+        }
+        this.startPlayback();
+      });
+    };
+    this.mediaRecorder.stop();
+  }
+  abortRecording(){
+    if (this.mediaRecorder && this.state==='recording'){
+      try{ this.mediaRecorder.ondataavailable=null; this.mediaRecorder.stop(); }catch{}
+      this.mediaRecorder=null; this.chunks=[]; this.state='ready'; this.loopBuffer=null; this.loopDuration=0; this.setRing(0); this.updateUI();
+    }
+  }
+
+  // ===== After-FX CHAIN WIRING =====
   _disconnectChain(){
     // Disconnect old chain safely
     try{ this.gainNode.disconnect(); }catch{}
@@ -1035,33 +650,19 @@ abortRecording(){
 }
 
 // ======= BUILD LOOPERS + KEYBINDS =======
-const keyMap = [
-  {rec:'w',stop:'s'},
-  {rec:'e',stop:'d'},
-  {rec:'r',stop:'f'},
-  {rec:'t',stop:'g'}
-];
-
+const keyMap = [{rec:'w',stop:'s'},{rec:'e',stop:'d'},{rec:'r',stop:'f'},{rec:'t',stop:'g'}];
 window.loopers = [];
-for (let i=1; i<=4; i++) {
-  loopers[i] = new Looper(i, keyMap[i-1].rec, keyMap[i-1].stop);
-}
+for (let i=1;i<=4;i++) loopers[i] = new Looper(i, keyMap[i-1].rec, keyMap[i-1].stop);
 
 document.addEventListener('keydown', e=>{
-  // 🔐 Block hotkeys until login
-  if (!isAuthed) return;
-
-  const k = e.key.toLowerCase();
+  const k=e.key.toLowerCase();
   loopers.forEach((lp, idx)=>{
-    if (idx === 0) return;
-    if (k === keyMap[idx-1].rec) {
-      lp.mainBtn.click();
-      e.preventDefault();
-    }
-    if (k === keyMap[idx-1].stop) {
-      if (lp.state === 'playing' || lp.state === 'overdub') lp.stopPlayback();
-      else if (lp.state === 'stopped') lp.resumePlayback();
-      else if (lp.state === 'recording') lp.abortRecording();
+    if (idx===0) return;
+    if (k===keyMap[idx-1].rec){ lp.mainBtn.click(); e.preventDefault(); }
+    if (k===keyMap[idx-1].stop){
+      if (lp.state==='playing'||lp.state==='overdub') lp.stopPlayback();
+      else if (lp.state==='stopped') lp.resumePlayback();
+      else if (lp.state==='recording') lp.abortRecording();
       e.preventDefault();
     }
   });
