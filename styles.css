@@ -72,7 +72,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   margin: 26px auto 10px auto;
-  max-width: 1400px;
+  max-width: 1500px;
 
   /* NEW: fix overlap + allow zoom/scroll */
   transform: scale(0.92);
@@ -362,5 +362,6 @@ select {
 ::-webkit-scrollbar-thumb { background: #384080; border-radius: 8px; }
 
 .hidden { display: none !important; }
+
 
 
