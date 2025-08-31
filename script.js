@@ -74,11 +74,13 @@ function debounce(fn, ms=130){ let t; return (...a)=>{ clearTimeout(t); t=setTim
 // ………………………………………
 
 // ======= ZOOM SLIDER CONTROL =======
+// ======= ZOOM SLIDER CONTROL =======
 const zoomSlider = document.getElementById("zoomSlider");
 if (zoomSlider) {
   zoomSlider.addEventListener("input", () => {
     const val = zoomSlider.value / 100; // range 0.7 - 1.1
-    document.querySelector(".pedal-board").style.transform = `scale(${val})`;
+    document.body.style.transform = `scale(${val})`;
+    document.body.style.transformOrigin = "top center";
   });
 }
 
