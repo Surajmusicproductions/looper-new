@@ -69,17 +69,15 @@ body {
   display: flex;
   flex-direction: row;
   gap: 30px;
-  justify-content: center;
+  justify-content: flex-start;   /* was center → now start, so scroll begins from left */
   align-items: flex-start;
   margin: 26px auto 10px auto;
-  max-width: 1500px;
-
-  /* NEW: fix overlap + allow zoom/scroll */
-  transform: scale(0.92);
-  transform-origin: top center;
-  overflow-x: auto;
+  max-width: none;               /* remove width limit */
+  width: max-content;            /* expands to fit all pedals */
+  overflow-x: auto;              /* horizontal scroll */
   padding-bottom: 12px;
 }
+
 
 .looper-pedal {
   background:
@@ -362,6 +360,7 @@ select {
 ::-webkit-scrollbar-thumb { background: #384080; border-radius: 8px; }
 
 .hidden { display: none !important; }
+
 
 
 
