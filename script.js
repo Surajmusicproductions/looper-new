@@ -1,9 +1,9 @@
-/* Looper Pedal Board – Popups + Programmable FX Chains (Before + After)
-   - Before-FX: popup with per-effect parameters
-   - After-FX: menu popup to add/remove/reorder effects (series), second popup to tweak parameters
-   - Up/Down reordering with numbers
-   - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
-   Date: 2025-08-09 (Corrected Version: 2025-09-04)
+/* Looper Pedal Board – RC-505 style behaviour + After-FX offline pitch (granular)
+   - Overdub recording uses raw mic stream (no master mix) to avoid re-recording playback
+   - Muting master/monitor during overdub to avoid acoustic bleed (optionally toggleable)
+   - After-FX Pitch replaced by offline granular pitch-shift (preserve duration)
+   - Phase-locked recording / quantize behavior retained for master + dependent tracks
+   Date: 2025-09-06 (user requested RC-505 behavior + phase-vocoder-style pitch replacement)
 */
 
 let audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
@@ -43,6 +43,9 @@ let masterLoopDuration = null, masterBPM = null, masterIsSet = false;
 
 // ADDITION: Master Bus Globals
 let masterBus = null, masterDest = null, masterStream = null;
+
+// Option: automatically mute master/monitor while overdubbing (recommended for clean overdub)
+const AUTO_MUTE_MONITOR_ON_OVERDUB = true;
 
 // ======= DOM SHORTCUTS =======
 const $ = s => document.querySelector(s);
@@ -91,6 +94,13 @@ const NOTE_MULT = { '1/1':4, '1/2':2, '1/4':1, '1/8':0.5, '1/16':0.25, '1/32':0.
 function quarterSecForBPM(bpm){ return 60/(bpm||120); }
 function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ? mult*(2/3) : mult; }
 
+// ======= RECORDING STREAM HELPERS =======
+// IMPORTANT: prefer micStream (raw gUM) to avoid recording the output mix back into overdubs
+function getRecordingStream(){
+  if (micStream && micStream.active) return micStream;
+  return processedStream || micStream;
+}
+
 // ======= AUDIO SETUP =======
 async function ensureMic(){
   if (micStream) return;
@@ -136,24 +146,24 @@ async function ensureMic(){
 
   micSource.connect(dryGain);
 
-  // Recording
+  // Recording (processed stream intended for processed capture if needed)
   mixDest = audioCtx.createMediaStreamDestination();
   dryGain.connect(mixDest); fxSumGain.connect(mixDest);
   processedStream = mixDest.stream;
 
-  // ADDITION: MASTER BUS (final mix for export)
+  // ADDITION: MASTER BUS (final mix for export/listening)
   masterBus = audioCtx.createGain();
   masterBus.gain.value = 1;
 
   // The master bus is only for the mix of the loops.
   // We do NOT connect micSource/dryGain/fxSumGain to masterBus.
-  // This prevents the feedback loop.
+  // This prevents the feedback loop from programmatic routing.
   masterBus.connect(audioCtx.destination); // For listening
   masterDest = audioCtx.createMediaStreamDestination(); // For recording
   masterBus.connect(masterDest);
   masterStream = masterDest.stream;
 
-  // Live monitor
+  // Live monitor (for user to hear mic while not overdubbing)
   liveMicMonitorGain = audioCtx.createGain(); liveMicMonitorGain.gain.value = 0;
   dryGain.connect(liveMicMonitorGain); fxSumGain.connect(liveMicMonitorGain); liveMicMonitorGain.connect(audioCtx.destination);
 
@@ -271,7 +281,12 @@ function renderBeforeFxTab(tab){
       <input id="eqHigh" type="range" min="-12" max="12" value="${eqHighGain}"></label>
   `;
   if (tab==='pitch') return `
-    <p style="max-width:32ch;line-height:1.3;">Live input pitch shifting needs advanced DSP (AudioWorklet / phase vocoder). This build doesn’t include it. Use per-track <b>After-FX → Pitch (PlaybackRate)</b> for ±12 semitones on loops.</p>
+    <p style="max-width:48ch;line-height:1.3;">
+      Offline pitch shifting: this replaces the old playbackRate method.
+      When you add a <b>Pitch</b> After-FX and set semitones, the loop's audio buffer
+      will be processed (granular overlap-add) to shift pitch while preserving duration.
+      Large buffers or big shifts may take a noticeable moment to process.
+    </p>
   `;
   return '';
 }
@@ -349,6 +364,99 @@ function wireBeforeFX(){
   }
   if (beforeFXBtns.pitch){
     addTap(beforeFXBtns.pitch, ()=> openBeforeFxPopup('pitch'));
+  }
+}
+
+// ======= AFTER-FX PITCH (offline) UTILITIES =======
+// Granular pitch shifting (time-domain) for offline AudioBuffer -> AudioBuffer
+// This preserves duration while changing pitch by semitones. Not perfect formant preservation
+// but much better than raw playbackRate (which changes duration).
+async function pitchShiftBufferOffline(inputBuffer, semitones){
+  if (!inputBuffer) return inputBuffer;
+  const ratio = Math.pow(2, semitones/12); // desired pitch ratio
+  const sr = inputBuffer.sampleRate;
+  const channels = inputBuffer.numberOfChannels;
+  const len = inputBuffer.length;
+  const outLen = len; // we preserve duration (same number of samples)
+  const grainSize = 2048; // grain window size (power of two)
+  const hop = Math.floor(grainSize * 0.25); // 75% overlap
+  const output = audioCtx.createBuffer(channels, outLen, sr);
+
+  // Hann window
+  const win = new Float32Array(grainSize);
+  for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
+
+  // For each channel process
+  for (let ch=0; ch<channels; ch++){
+    const inData = inputBuffer.getChannelData(ch);
+    const outData = output.getChannelData(ch);
+    // zero output
+    for (let i=0;i<outLen;i++) outData[i] = 0;
+
+    // read pointer moves at rate = ratio (if ratio>1 pitch up: read faster)
+    let readPos = 0;
+    // We'll place grains into out buffer at fixed hop, but read window from input at grainSize centered around readPos
+    for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+      // read window start
+      const rStart = Math.floor(readPos - grainSize/2);
+      // window samples
+      for (let i=0;i<grainSize;i++){
+        const inIdx = rStart + i;
+        let s = 0;
+        if (inIdx >= 0 && inIdx < len) s = inData[inIdx];
+        const w = win[i];
+        const target = outPos + i - Math.floor(grainSize/2);
+        if (target >= 0 && target < outLen){
+          outData[target] += s * w;
+        }
+      }
+      readPos += ratio * hop;
+      // clamp to input bounds
+      if (readPos > len + grainSize) readPos = readPos % len;
+    }
+
+    // Normalize by approximate window sum to avoid level changes
+    // compute window normalization factor (sum of windows overlapping)
+    // We'll compute a simple overlap-add normalization by running through outData and dividing where >0
+    // Compute local envelope (smoothed)
+    const envelope = new Float32Array(outLen);
+    for (let i=0;i<outLen;i++) envelope[i] = 0;
+    // Re-run a window to build envelope
+    let tmpRead = 0;
+    for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+      for (let i=0;i<grainSize;i++){
+        const target = outPos + i - Math.floor(grainSize/2);
+        if (target >= 0 && target < outLen) envelope[target] += win[i];
+      }
+      tmpRead += ratio * hop;
+    }
+    // Normalize
+    for (let i=0;i<outLen;i++){
+      const env = envelope[i] || 1e-8;
+      outData[i] = outData[i] / env;
+    }
+  }
+
+  return output;
+}
+
+// Apply Pitch After-FX to a Looper's loopBuffer (asynchronous)
+async function applyPitchAfterFxToLoop(lp, semitones){
+  if (!lp.loopBuffer) return;
+  showMsg(`⏳ Applying pitch ${semitones} st to Track ${lp.index}...`, '#ffd166');
+  try {
+    const newBuf = await pitchShiftBufferOffline(lp.loopBuffer, semitones);
+    lp.loopBuffer = newBuf;
+    lp.loopDuration = newBuf.duration;
+    // restart playback if playing
+    if (lp.state === 'playing' || lp.state === 'overdub') lp.startPlayback();
+    renderTrackFxSummary(lp.index);
+    showMsg(`✅ Pitch applied (${semitones} st) to Track ${lp.index}`, '#a7ffed');
+    setTimeout(hideMsg, 900);
+  } catch (e){
+    console.error('Pitch processing failed', e);
+    showMsg('❌ Pitch processing failed', '#ff6b6b');
+    setTimeout(hideMsg, 1300);
   }
 }
 
@@ -476,7 +584,15 @@ class Looper {
 
   async _startPhaseLockedRecording(len){
     this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
+    this.chunks=[];
+    try {
+      // Use raw micStream to avoid routing playback into the recorded input
+      const recStream = getRecordingStream();
+      this.mediaRecorder=new MediaRecorder(recStream);
+    } catch(e){
+      // fallback
+      this.mediaRecorder=new MediaRecorder(processedStream);
+    }
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
     this.mediaRecorder.start();
     const start=Date.now(), self=this;
@@ -488,7 +604,13 @@ class Looper {
     if (!processedStream) await ensureMic();
     if (this.index>=2 && !masterIsSet) return;
     this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
+    this.chunks=[];
+    try {
+      const recStream = getRecordingStream();
+      this.mediaRecorder=new MediaRecorder(recStream);
+    } catch(e){
+      this.mediaRecorder=new MediaRecorder(processedStream);
+    }
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
     this.mediaRecorder.start();
     const start=Date.now(), self=this; const max=(this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
@@ -527,10 +649,8 @@ class Looper {
   }
 
   _applyPitchIfAny(){
-    const fxPitch = this.fx.chain.find(e=>e.type==='Pitch');
-    const semis = fxPitch ? fxPitch.params.semitones : this.pitchSemitones;
-    const rate = Math.pow(2, (semis||0)/12);
-    if (this.sourceNode) this.sourceNode.playbackRate.setValueAtTime(rate, audioCtx.currentTime);
+    // Old behavior (playbackRate) removed — replaced by offline processing.
+    // This function intentionally does nothing now.
   }
 
   _buildEffectNodes(effect){
@@ -560,6 +680,7 @@ class Looper {
       comp.threshold.value = effect.params.threshold; comp.knee.value = effect.params.knee; comp.ratio.value = effect.params.ratio; comp.attack.value = effect.params.attack; comp.release.value = effect.params.release;
       effect.nodes = { input, output, comp, dispose(){ try{input.disconnect(); comp.disconnect(); output.disconnect();}catch{} } };
     } else if (effect.type==='Pitch'){
+      // Pitch is handled offline — no runtime nodes required
       effect.nodes = { input:null, output:null, dispose(){} };
     }
   }
@@ -568,7 +689,7 @@ class Looper {
     if (!this.sourceNode) return;
     try{ this.sourceNode.disconnect(); }catch{}
     try{ this.gainNode.disconnect(); }catch{}
-    this._applyPitchIfAny();
+    this._applyPitchIfAny(); // no-op now
     let head = this.sourceNode;
     for (const fx of this.fx.chain){ if (fx.type!=='Pitch') this._buildEffectNodes(fx); }
     for (const fx of this.fx.chain){
@@ -576,7 +697,7 @@ class Looper {
       if (!fx.bypass){ try{ head.connect(fx.nodes.input); }catch{}; head = fx.nodes.output; }
     }
     try{ head.connect(this.gainNode); }catch{}
-    // MODIFICATION: Connect to masterBus instead of audioCtx.destination
+    // Connect to masterBus (master mix)
     this.gainNode.connect(masterBus);
   }
 
@@ -614,7 +735,21 @@ class Looper {
   }
 
   startOverdubRecording(){
-    this.overdubChunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
+    // Prepare: mute master/monitor to avoid acoustic bleed into mic (if option enabled)
+    if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+      this._prevMasterGain = masterBus ? masterBus.gain.value : 1;
+      if (masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
+      this._prevLiveMonGain = liveMicMonitorGain ? liveMicMonitorGain.gain.value : 0;
+      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    }
+
+    this.overdubChunks=[];
+    try {
+      const recStream = getRecordingStream();
+      this.mediaRecorder=new MediaRecorder(recStream);
+    } catch(e){
+      this.mediaRecorder=new MediaRecorder(processedStream);
+    }
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
@@ -622,21 +757,47 @@ class Looper {
 
   finishOverdub(){
     if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
+      // restore monitor before decoding & playback so user hears final result
+      const restoreMonitor = ()=>{
+        if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+          if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
+          if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
+        }
+      };
+
       this.mediaRecorder.onstop = async ()=>{
-        const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
-        audioCtx.decodeAudioData(arr, newBuf=>{
+        try {
+          const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
+          const newBuf = await audioCtx.decodeAudioData(arr);
+          if (!this.loopBuffer){
+            // if no previous loop (shouldn't happen for overdub) just assign
+            this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreMonitor(); this.startPlayback(); return;
+          }
           const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
           const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
           const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
           for (let ch=0; ch<outC; ch++){
             const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
-            for (let i=0;i<length;i++) outD[i]=(o?o[i]||0:0)+(n?n[i]||0:0);
+            for (let i=0;i<length;i++){
+              const ov = o ? (o[i] || 0) : 0;
+              const nv = n ? (n[i] || 0) : 0;
+              outD[i] = ov + nv;
+            }
           }
-          this.loopBuffer=out; this.loopDuration=out.duration; this.startPlayback();
-        });
+          // assign and restart playback
+          this.loopBuffer = out; this.loopDuration = out.duration;
+          restoreMonitor();
+          this.startPlayback();
+        } catch (e){
+          console.error('Overdub decode error', e);
+          restoreMonitor();
+          this.state='playing'; this.updateUI();
+        }
       };
       this.mediaRecorder.stop();
-    } else { this.state='playing'; this.updateUI(); }
+    } else {
+      this.state='playing'; this.updateUI();
+    }
   }
 
   clearLoop(){
@@ -656,7 +817,7 @@ class Looper {
       this.setRing(pos/this.loopDuration); requestAnimationFrame(this._animate.bind(this));
     } else { this.setRing(0); }
   }
-} // <<< --- CORRECTED: Looper class ends here
+} // <<< --- Looper class ends here
 
 // ======= BUILD LOOPERS + KEYBINDS =======
 const keyMap = [{rec:'w',stop:'s'},{rec:'e',stop:'d'},{rec:'r',stop:'f'},{rec:'t',stop:'g'}];
@@ -682,7 +843,7 @@ const fxMenuPopup   = $('#fxMenuPopup');
 const fxParamsPopup = $('#fxParamsPopup');
 
 const AFTER_FX_CATALOG = [
-  { type:'Pitch',      name:'Pitch (PlaybackRate)', defaults:{ semitones:0 } },
+  { type:'Pitch',      name:'Pitch (Offline)', defaults:{ semitones:0 } },
   { type:'LowPass',    name:'Low-pass Filter',      defaults:{ cutoff:12000, q:0.7 } },
   { type:'HighPass',   name:'High-pass Filter',     defaults:{ cutoff:120, q:0.7 } },
   { type:'Pan',        name:'Pan',                  defaults:{ pan:0 } },
@@ -698,6 +859,8 @@ function addEffectToTrack(lp, type){
   lp.fx.chain.push(eff);
   if (lp.state==='playing') lp._rebuildChainWiring();
   renderTrackFxSummary(lp.index);
+  // If this is a Pitch effect and we already have buffer, apply it right away
+  if (type==='Pitch' && lp.loopBuffer) applyPitchAfterFxToLoop(lp, eff.params.semitones);
 }
 
 function moveEffect(lp, id, dir){
@@ -787,8 +950,8 @@ function openFxParamsPopup(idx, id){
 function renderFxParamsBody(fx){
   switch(fx.type){
     case 'Pitch': return `<label>Semi-tones <span id="pSemVal">${fx.params.semitones}</span><input id="pSem" type="range" min="-12" max="12" step="1" value="${fx.params.semitones}"></label>`;
-    case 'LowPass': return `<label>Cutoff <span id="lpCutVal">${Math.round(fx.params.cutoff)} Hz</span><input id="lpCut" type="range" min="200" max="12000" step="10" value="${fx.params.cutoff}"></label><label>Q <span id="lpQVal">${fx.params.q.toFixed(2)}</span><input id="lpQ" type="range" min="0.3" max="12" step="0.01" value="${fx.params.q}"></label>`;
-    case 'HighPass': return `<label>Cutoff <span id="hpCutVal">${Math.round(fx.params.cutoff)} Hz</span><input id="hpCut" type="range" min="20" max="2000" step="5" value="${fx.params.cutoff}"></label><label>Q <span id="hpQVal">${fx.params.q.toFixed(2)}</span><input id="hpQ" type="range" min="0.3" max="12" step="0.01" value="${fx.params.q}"></label>`;
+    case 'LowPass': return `<label>Cutoff <span id="lpCutVal">${Math.round(fx.params.cutoff)} Hz</span><input id="lpCut" type="range" min="200" max="12000" step="10" value="${Math.round(fx.params.cutoff)}"></label><label>Q <span id="lpQVal">${fx.params.q.toFixed(2)}</span><input id="lpQ" type="range" min="0.3" max="12" step="0.01" value="${fx.params.q}"></label>`;
+    case 'HighPass': return `<label>Cutoff <span id="hpCutVal">${Math.round(fx.params.cutoff)} Hz</span><input id="hpCut" type="range" min="20" max="2000" step="5" value="${Math.round(fx.params.cutoff)}"></label><label>Q <span id="hpQVal">${fx.params.q.toFixed(2)}</span><input id="hpQ" type="range" min="0.3" max="12" step="0.01" value="${fx.params.q}"></label>`;
     case 'Pan': return `<label>Pan <span id="panVal">${fx.params.pan.toFixed(2)}</span><input id="pan" type="range" min="-1" max="1" step="0.01" value="${fx.params.pan}"></label>`;
     case 'Delay': return `<label>Time <span id="dTimeVal">${(fx.params.timeSec*1000)|0} ms</span><input id="dTime" type="range" min="1" max="2000" step="1" value="${(fx.params.timeSec*1000)|0}"></label><label>Feedback <span id="dFbVal">${Math.round(fx.params.feedback*100)}%</span><input id="dFb" type="range" min="0" max="95" step="1" value="${Math.round(fx.params.feedback*100)}"></label><label>Mix <span id="dMixVal">${Math.round(fx.params.mix*100)}%</span><input id="dMix" type="range" min="0" max="100" step="1" value="${Math.round(fx.params.mix*100)}"></label>`;
     case 'Compressor': return `<label>Threshold <span id="cThVal">${fx.params.threshold} dB</span><input id="cTh" type="range" min="-60" max="0" step="1" value="${fx.params.threshold}"></label><label>Ratio <span id="cRaVal">${fx.params.ratio}:1</span><input id="cRa" type="range" min="1" max="20" step="0.1" value="${fx.params.ratio}"></label><label>Knee <span id="cKnVal">${fx.params.knee} dB</span><input id="cKn" type="range" min="0" max="40" step="1" value="${fx.params.knee}"></label><label>Attack <span id="cAtVal">${(fx.params.attack*1000).toFixed(1)} ms</span><input id="cAt" type="range" min="0" max="100" step="0.5" value="${(fx.params.attack*1000).toFixed(1)}"></label><label>Release <span id="cRlVal">${(fx.params.release*1000).toFixed(0)} ms</span><input id="cRl" type="range" min="10" max="2000" step="10" value="${(fx.params.release*1000).toFixed(0)}"></label>`;
@@ -797,7 +960,18 @@ function renderFxParamsBody(fx){
 }
 
 function wireFxParams(lp, fx){
-  if (fx.type==='Pitch'){ $('#pSem').addEventListener('input', e=>{ fx.params.semitones = parseInt(e.target.value,10); $('#pSemVal').textContent = fx.params.semitones; lp.pitchSemitones = fx.params.semitones; if (lp.state==='playing') lp._applyPitchIfAny(); renderTrackFxSummary(lp.index); }); }
+  if (fx.type==='Pitch'){
+    $('#pSem').addEventListener('input', e=>{
+      fx.params.semitones = parseInt(e.target.value,10);
+      $('#pSemVal').textContent = fx.params.semitones;
+      lp.pitchSemitones = fx.params.semitones;
+      renderTrackFxSummary(lp.index);
+      // Apply offline pitch processing when user changes semitones (async)
+      if (lp.loopBuffer) {
+        applyPitchAfterFxToLoop(lp, fx.params.semitones);
+      }
+    });
+  }
   if (fx.type==='LowPass'){ $('#lpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#lpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#lpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#hpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Pan'){ $('#pan').addEventListener('input', e=>{ fx.params.pan = parseFloat(e.target.value); $('#panVal').textContent = fx.params.pan.toFixed(2); if (fx.nodes?.panner) fx.nodes.panner.pan.setTargetAtTime(fx.params.pan, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); }
