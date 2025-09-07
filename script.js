@@ -574,7 +574,7 @@ class Looper {
   }
 
   async phaseLockedRecord(){
-    if (!processedStream) await ensureMic();
+    await ensureMic();
     if (this.index===1 || !masterIsSet){ await this.startRecording(); return; }
     this.state='waiting'; this.updateUI();
     const now = audioCtx.currentTime, master = loopers[1];
@@ -609,7 +609,7 @@ class Looper {
   }
 
   async startRecording(){
-    if (!processedStream) await ensureMic();
+    await ensureMic();
     if (this.index>=2 && !masterIsSet) return;
     this.state='recording'; this.updateUI();
     this.chunks=[];
@@ -1169,15 +1169,4 @@ async function saveMasterRecording(){
   URL.revokeObjectURL(a.href);
   showMsg('✅ Saved WebM to downloads', '#a7ffed');
   setTimeout(hideMsg, 1500);
-}
-
-// Wire the button
-const mixBtn = document.getElementById('mixRecBtn');
-if (mixBtn){
-  addTap(mixBtn, ()=>{
-    if (!mixRecording) startMasterRecording();
-    else stopMasterRecording();
-  });
-}
-
-}
+  }
