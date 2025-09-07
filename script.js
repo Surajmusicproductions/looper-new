@@ -707,6 +707,7 @@ function submitPitchJobToPool(inputBuffer, semitones, onProgress = ()=>{}, timeo
   let finished = false;
   let listener = null;
   let timer = null;
+  let _cancelled = false;
 
   const promise = new Promise((resolve, reject) => {
     listener = (ev) => {
@@ -714,9 +715,17 @@ function submitPitchJobToPool(inputBuffer, semitones, onProgress = ()=>{}, timeo
       if (d.id !== id && d.id !== undefined) return;
       if (d.cmd === 'progress') onProgress(d.pct);
       if (d.cmd === 'done') {
+        if (_cancelled) {
+          finished = true;
+          worker.removeEventListener('message', listener);
+          poolItem.busy = false;
+          clearTimeout(timer);
+          reject(new Error('cancelled'));
+          return;
+        }
         try {
           const { channels: chBuffers, outLen, sr: outSR } = d;
-          const outBuf = audioCtx.createBuffer(chBuffers.length, outLen, outSR);
+          const outBuf = audioCtx.createBuffer(chBuffers.length, outLen, outSR || audioCtx.sampleRate);
           for (let c=0; c<chBuffers.length; c++){
             const fa = new Float32Array(chBuffers[c]);
             outBuf.copyToChannel(fa, c, 0);
@@ -748,6 +757,7 @@ function submitPitchJobToPool(inputBuffer, semitones, onProgress = ()=>{}, timeo
       poolItem.busy = false;
       try {
         const fallback = await inlinePitchShift(inputBuffer, semitones, grainSize, hop);
+        if (_cancelled) return reject(new Error('cancelled'));
         resolve(fallback);
       } catch (e){
         reject(e);
@@ -761,18 +771,21 @@ function submitPitchJobToPool(inputBuffer, semitones, onProgress = ()=>{}, timeo
       clearTimeout(timer);
       worker.removeEventListener('message', listener);
       poolItem.busy = false;
-      inlinePitchShift(inputBuffer, semitones, grainSize, hop).then(resolve).catch(reject);
+      inlinePitchShift(inputBuffer, semitones, grainSize, hop).then(out => {
+        if (_cancelled) return reject(new Error('cancelled'));
+        resolve(out);
+      }).catch(reject);
     }
   });
 
   const cancel = () => {
     try {
-      if (finished) return;
+      _cancelled = true;
       worker.postMessage({ cmd:'cancel', id });
     } catch(e){ /* ignore */ }
   };
 
-  return { promise, cancel };
+  return { promise, cancel, _isCancelled: ()=> _cancelled };
 }
 
 async function inlinePitchShift(inputBuffer, semitones, grainSize=2048, hop=Math.floor(2048*0.25)){
@@ -839,7 +852,6 @@ async function applyPitchAfterFxToLoop(lp, semitones){
   lp._pitchJob = jobHandle;
   try {
     const newBuf = await jobHandle.promise;
-    if (lp._pitchJob && lp._pitchJob.cancelled) { showMsg('⚠️ Pitch cancelled', '#ffe066'); lp._pitchJob = null; return; }
     lp._lastUnprocessedBuffer = lp.loopBuffer;
     lp.loopBuffer = newBuf;
     lp.loopDuration = newBuf.duration;
@@ -848,11 +860,16 @@ async function applyPitchAfterFxToLoop(lp, semitones){
     showMsg(`✅ Pitch applied (${semitones} st) to Track ${lp.index}`, '#a7ffed');
     setTimeout(hideMsg, 900);
   } catch (e){
-    if (lp._pitchJob && typeof lp._pitchJob.cancel === 'function') lp._pitchJob = null;
-    console.error('Pitch processing failed', e);
-    showMsg('❌ Pitch processing failed', '#ff6b6b');
-    setTimeout(hideMsg, 1300);
+    if (e && e.message === 'cancelled') {
+      showMsg('⚠️ Pitch cancelled', '#ffe066');
+      setTimeout(hideMsg, 700);
+    } else {
+      console.error('Pitch processing failed', e);
+      showMsg('❌ Pitch processing failed', '#ff6b6b');
+      setTimeout(hideMsg, 1300);
+    }
   } finally {
+    lp._pitchJob = null;
     lp.uiDisabled = false;
     lp.updateUI();
   }
