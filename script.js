@@ -127,9 +127,18 @@ function getRecordingStream(){
   if (!isMicStreamAlive(micStream)) return null;
   // Create a new MediaStream comprised of mic audio tracks only (avoid sharing mixed destinations)
   const ms = new MediaStream();
-  micStream.getAudioTracks().forEach(t => {
-    if (t.enabled && t.readyState === 'live') ms.addTrack(t.clone ? t.clone() : t);
-  });
+  try {
+    const tracks = micStream.getAudioTracks ? micStream.getAudioTracks() : [];
+    tracks.forEach(t => {
+      if (t.enabled && t.readyState === 'live') {
+        const tr = typeof t.clone === 'function' ? t.clone() : t;
+        tr.enabled = true;
+        ms.addTrack(tr);
+      }
+    });
+  } catch (e) {
+    return micStream;
+  }
   return ms;
 }
 
@@ -212,10 +221,10 @@ function muteForOverdub(lp){
     lp._prevMasterGain = masterBus ? masterBus.gain.value : 1;
     lp._prevLiveMonGain = liveMicMonitorGain ? liveMicMonitorGain.gain.value : 0;
     if (AUTO_MUTE_MONITOR_ON_OVERDUB){
-      if (masterBus) masterBus.gain.cancelScheduledValues(audioCtx.currentTime);
-      if (masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
-      if (liveMicMonitorGain) liveMicMonitorGain.gain.cancelScheduledValues(audioCtx.currentTime);
-      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+      if (masterBus) { masterBus.gain.cancelScheduledValues(audioCtx.currentTime); masterBus.gain.setValueAtTime(0, audioCtx.currentTime); }
+      if (liveMicMonitorGain) {
+        try { liveMicMonitorGain.disconnect(audioCtx.destination); } catch(e){}
+      }
     }
   } catch(e){ console.warn('muteForOverdub failed', e); }
 }
@@ -224,8 +233,9 @@ function restoreAfterOverdub(lp){
     if (AUTO_MUTE_MONITOR_ON_OVERDUB){
       if (masterBus) masterBus.gain.cancelScheduledValues(audioCtx.currentTime);
       if (masterBus) masterBus.gain.setValueAtTime((lp? (lp._prevMasterGain ?? 1) : 1), audioCtx.currentTime);
-      if (liveMicMonitorGain) liveMicMonitorGain.gain.cancelScheduledValues(audioCtx.currentTime);
-      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((lp? (lp._prevLiveMonGain ?? 0) : 0), audioCtx.currentTime);
+      if (liveMicMonitorGain) {
+        try { liveMicMonitorGain.connect(audioCtx.destination); liveMicMonitorGain.gain.setValueAtTime((lp? (lp._prevLiveMonGain ?? 0) : 0), audioCtx.currentTime); } catch(e){}
+      }
     }
   } catch(e){ console.warn('restoreAfterOverdub failed', e); }
 }
@@ -417,9 +427,27 @@ async function ensureMic(){
     try { await audioCtx.resume(); } catch {}
   }
   if (!navigator.mediaDevices?.getUserMedia) { showMsg('❌ Microphone not supported'); throw new Error('gUM'); }
+  
+  const sel = document.getElementById('inputDeviceSelect');
+  const deviceId = sel ? sel.value : '';
+  const constraints = { audio:{
+    echoCancellation:false, noiseSuppression:false, autoGainControl:false,
+    deviceId: deviceId ? { exact: deviceId } : undefined
+  }};
+
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
+    micStream = await navigator.mediaDevices.getUserMedia(constraints);
   } catch(e){ showMsg('❌ Microphone access denied'); throw e; }
+
+  // Apply sample rate constraint if supported
+  try {
+    const track = micStream.getAudioTracks()[0];
+    if (track) {
+      await track.applyConstraints({ sampleRate: audioCtx.sampleRate });
+    }
+  } catch(e) {
+    console.warn('Could not apply sample rate constraints', e);
+  }
 
   micSource = audioCtx.createMediaStreamSource(micStream);
 
@@ -1582,7 +1610,11 @@ if (monitorBtn){
   monitorBtn.addEventListener('click', async ()=>{
     await ensureMic();
     liveMicMonitoring = !liveMicMonitoring;
-    liveMicMonitorGain.gain.value = liveMicMonitoring ? 1 : 0;
+    if (liveMicMonitoring) {
+        liveMicMonitorGain.gain.value = 1;
+    } else {
+        liveMicMonitorGain.gain.value = 0;
+    }
     monitorBtn.textContent = liveMicMonitoring ? 'Live MIC ON 🎤' : 'Live MIC OFF';
     monitorBtn.classList.toggle('active', liveMicMonitoring);
   });
