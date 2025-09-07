@@ -122,9 +122,15 @@ function isMicStreamAlive(ms){
   return tracks.some(t => t.enabled && t.readyState === 'live');
 }
 
+// Re-implemented to be strict and explicit
 function getRecordingStream(){
-  if (isMicStreamAlive(micStream)) return micStream;
-  return null;
+  if (!isMicStreamAlive(micStream)) return null;
+  // Create a new MediaStream comprised of mic audio tracks only (avoid sharing mixed destinations)
+  const ms = new MediaStream();
+  micStream.getAudioTracks().forEach(t => {
+    if (t.enabled && t.readyState === 'live') ms.addTrack(t.clone ? t.clone() : t);
+  });
+  return ms;
 }
 
 // Global recorder lock & safe factory
@@ -200,19 +206,25 @@ async function startRecordingWithSafety(lp, stream, options = {}){
   return mr;
 }
 
-// Centralize mute/unmute for overdub
+// Centralize mute/unmute for overdub with atomic changes
 function muteForOverdub(lp){
   try {
     lp._prevMasterGain = masterBus ? masterBus.gain.value : 1;
     lp._prevLiveMonGain = liveMicMonitorGain ? liveMicMonitorGain.gain.value : 0;
-    if (AUTO_MUTE_MONITOR_ON_OVERDUB && masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
-    if (AUTO_MUTE_MONITOR_ON_OVERDUB && liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+      if (masterBus) masterBus.gain.cancelScheduledValues(audioCtx.currentTime);
+      if (masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
+      if (liveMicMonitorGain) liveMicMonitorGain.gain.cancelScheduledValues(audioCtx.currentTime);
+      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    }
   } catch(e){ console.warn('muteForOverdub failed', e); }
 }
 function restoreAfterOverdub(lp){
   try {
     if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+      if (masterBus) masterBus.gain.cancelScheduledValues(audioCtx.currentTime);
       if (masterBus) masterBus.gain.setValueAtTime((lp? (lp._prevMasterGain ?? 1) : 1), audioCtx.currentTime);
+      if (liveMicMonitorGain) liveMicMonitorGain.gain.cancelScheduledValues(audioCtx.currentTime);
       if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((lp? (lp._prevLiveMonGain ?? 0) : 0), audioCtx.currentTime);
     }
   } catch(e){ console.warn('restoreAfterOverdub failed', e); }
@@ -227,7 +239,7 @@ function scheduleAtNextBar(masterDuration, divider=1){
   let toNext = masterDuration - masterElapsed;
   if (toNext < 1e-6) toNext = 0;
   const startAt = now + (toNext * divider);
-  return { startAt, waitMs: Math.round((startAt - now) * 1000) };
+  return { startAt, waitMs: Math.round(Math.max(0, (startAt - now) * 1000)) };
 }
 
 // Thorough AudioNode disposal helpers
@@ -243,6 +255,9 @@ function disposeEffectNodes(effect){
         const n = effect.nodes[k];
         if (n && typeof n.disconnect === 'function') n.disconnect();
       }
+    }
+    if (effect.type === 'Flanger' && effect.nodes.flangerLFO) {
+        try { effect.nodes.flangerLFO.stop(); } catch(e){}
     }
   } catch(err){ console.warn('dispose effect nodes failed', err); }
   effect.nodes = null;
@@ -310,6 +325,17 @@ function copyAudioBuffer(src){
   return out;
 }
 
+// Resample buffer to target sample rate
+async function resampleAudioBuffer(buf, targetSampleRate){
+  if (buf.sampleRate === targetSampleRate) return buf;
+  const offline = new OfflineAudioContext(buf.numberOfChannels, Math.ceil(buf.duration * targetSampleRate), targetSampleRate);
+  const src = offline.createBufferSource();
+  src.buffer = buf;
+  src.connect(offline.destination);
+  src.start(0);
+  return offline.startRendering();
+}
+
 // WAV encoder (no CDN dependency)
 function encodeWavFromAudioBuffer(buf){
   const numChannels = buf.numberOfChannels;
@@ -348,6 +374,39 @@ function encodeWavFromAudioBuffer(buf){
     offset += 2;
   }
   return new Blob([dv], { type: 'audio/wav' });
+}
+
+// Loopback detection
+async function detectLoopback(threshold = 0.02, testDurationMs = 800) {
+  const isEnabled = liveMicMonitoring;
+  if (!isEnabled) {
+    if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(1, audioCtx.currentTime);
+  }
+  
+  const analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048;
+  const micSrc = audioCtx.createMediaStreamSource(micStream);
+  micSrc.connect(analyser);
+
+  const data = new Float32Array(analyser.fftSize);
+
+  const tone = audioCtx.createOscillator();
+  const g = audioCtx.createGain(); g.gain.value = 0.12;
+  tone.connect(g); g.connect(masterBus);
+  tone.start();
+
+  await new Promise(r => setTimeout(r, testDurationMs));
+  
+  analyser.getFloatTimeDomainData(data);
+  tone.stop(); tone.disconnect(); g.disconnect();
+  micSrc.disconnect(analyser);
+
+  if (!isEnabled) {
+    if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  }
+
+  let sum=0; for(const v of data) sum += v*v;
+  const rms = Math.sqrt(sum/data.length);
+  return rms > threshold;
 }
 
 // ======= AUDIO SETUP =======
@@ -414,6 +473,14 @@ async function ensureMic(){
   dryGain.connect(liveMicMonitorGain); fxSumGain.connect(liveMicMonitorGain); liveMicMonitorGain.connect(audioCtx.destination);
 
   hideMsg();
+  
+  // Detect loopback once on startup
+  if (loopers[1]) {
+    loopers[1].isLoopbackDetected = await detectLoopback();
+    if (loopers[1].isLoopbackDetected) {
+      showMsg('⚠️ Warning: Hardware loopback detected. Overdubs may re-record playback. Consider disabling monitor in your audio interface settings.', '#ffcc00');
+    }
+  }
 }
 
 function ensureMasterBus(){
@@ -1238,13 +1305,16 @@ class Looper {
   async startOverdubRecording(){
     muteForOverdub(this);
     this.overdubChunks = [];
+    
+    // This part is crucial - only record from raw mic stream
     const recStream = getRecordingStream();
     if (!recStream) {
       restoreAfterOverdub(this);
-      showMsg('❌ Microphone not available for overdub', '#ff6b6b');
+      showMsg('❌ Microphone not available for overdub. Aborting.', '#ff6b6b');
       this.state = 'playing'; this.updateUI();
       return;
     }
+
     try {
       this.mediaRecorder = await startRecordingWithSafety(this, recStream, {
         expectedMs: this.loopDuration * 1000,
@@ -1273,6 +1343,7 @@ class Looper {
         return;
     }
     this.mediaRecorder.onstop = async ()=>{
+      pushUndoSnapshot(this);
       try {
         const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
         let newBuf = await decodeAudioBuffer(arr);
@@ -1310,6 +1381,9 @@ class Looper {
             const ov = o ? (o[i] || 0) : 0;
             const nv = n ? (n[i] || 0) : 0;
             outD[i] = ov + nv;
+            // Apply soft limiter to prevent clipping
+            if (outD[i] > 1) outD[i] = 1;
+            if (outD[i] < -1) outD[i] = -1;
           }
         }
 
@@ -1327,6 +1401,7 @@ class Looper {
   clearLoop(){
     disposeTrackNodes(this);
     this.loopBuffer=null; this.loopDuration=0; this.state='ready'; this.updateUI();
+    this.cancelPitchJob();
     if (this.index===1){
       masterLoopDuration=null; masterBPM=null; masterIsSet=false; bpmLabel.textContent='BPM: --';
       for (let k=2;k<=4;k++) loopers[k].disable(true);
