@@ -9,6 +9,17 @@
 let audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
 let micStream = null, micSource = null;
 
+// === Robustness / performance parameters ===
+const GLOBALS = {
+  WORKER_POOL_SIZE: Math.max(1, (navigator.hardwareConcurrency || 2) - 1), // pitch worker pool
+  PITCH_GRAIN_SIZE: 2048,
+  PITCH_HOP_RATIO: 0.25,          // hop = grainSize * hop_ratio
+  PITCH_JOB_TIMEOUT_MS: 45_000,   // timeout per pitch job (45s)
+  UNDO_STACK_LIMIT: 6,            // per-track undo slots
+  RECORDER_GLOBAL_TIMEOUT_MS: 120_000, // fallback guard for long recordings (2 mins)
+  RECORDER_POLL_INTERVAL_MS: 40,  // UI poll interval for progress
+};
+
 // ======= GLOBAL (Before-FX) GRAPH =======
 let dryGain, fxSumGain, mixDest, processedStream;
 
@@ -109,9 +120,224 @@ function getRecordingStream(){
   return null;
 }
 
+// Global recorder lock & safe factory
+let _globalRecordingLock = false;
+function tryClaimRecLock(){
+  if (_globalRecordingLock) return false;
+  _globalRecordingLock = true;
+  return true;
+}
+function releaseRecLock(){
+  _globalRecordingLock = false;
+}
+function pickAudioMime(){
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
+  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+  if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) return 'audio/ogg;codecs=opus';
+  return '';
+}
+function makeMediaRecorderSafe(stream){
+  const mime = pickAudioMime();
+  try {
+    return mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+  } catch (err) {
+    console.warn('MediaRecorder ctor failed with mime, trying without mime', err);
+    try { return new MediaRecorder(stream); } catch (err2) { throw err2; }
+  }
+}
+async function startRecordingWithSafety(lp, stream, options = {}){
+  if (!tryClaimRecLock()) { showMsg('Recorder busy', '#ffcc00'); throw new Error('rec-lock'); }
+  let mr = null, guardTimer = null, aborted = false;
+  try {
+    mr = makeMediaRecorderSafe(stream);
+  } catch(e){
+    releaseRecLock();
+    throw e;
+  }
+  mr.ondataavailable = e => { try { if (options.onData && e.data && e.data.size) options.onData(e.data); } catch(e){} };
+  mr.onerror = e => {
+    console.error('MediaRecorder error', e);
+    try { options.onError?.(e); } catch(_) {}
+    try { if (mr && mr.state !== 'inactive') mr.stop(); } catch(_) {}
+    releaseRecLock();
+  };
+  mr.onstop = async () => {
+    try { options.onStop?.(); } catch(e) {}
+    clearTimeout(guardTimer);
+    releaseRecLock();
+  };
+  try {
+    mr.start();
+  } catch (err){
+    releaseRecLock();
+    throw err;
+  }
+  if (options.expectedMs && options.expectedMs > 0) {
+    guardTimer = setTimeout(() => {
+      try {
+        if (mr && mr.state === 'recording') { mr.stop(); }
+      } catch (e) {}
+    }, Math.min(options.expectedMs + 2000, GLOBALS.RECORDER_GLOBAL_TIMEOUT_MS));
+  } else {
+    guardTimer = setTimeout(() => {
+      try { if (mr && mr.state === 'recording') mr.stop(); } catch(e){}
+    }, GLOBALS.RECORDER_GLOBAL_TIMEOUT_MS);
+  }
+  return mr;
+}
+
+// Centralize mute/unmute for overdub
+function muteForOverdub(lp){
+  try {
+    lp._prevMasterGain = masterBus ? masterBus.gain.value : 1;
+    lp._prevLiveMonGain = liveMicMonitorGain ? liveMicMonitorGain.gain.value : 0;
+    if (AUTO_MUTE_MONITOR_ON_OVERDUB && masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
+    if (AUTO_MUTE_MONITOR_ON_OVERDUB && liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  } catch(e){ console.warn('muteForOverdub failed', e); }
+}
+function restoreAfterOverdub(lp){
+  try {
+    if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+      if (masterBus) masterBus.gain.setValueAtTime((lp? (lp._prevMasterGain ?? 1) : 1), audioCtx.currentTime);
+      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((lp? (lp._prevLiveMonGain ?? 0) : 0), audioCtx.currentTime);
+    }
+  } catch(e){ console.warn('restoreAfterOverdub failed', e); }
+}
+
+// use audioCtx.currentTime for phase-locked scheduling
+function scheduleAtNextBar(masterDuration, divider=1){
+  const now = audioCtx.currentTime;
+  const master = loopers[1];
+  if (!master || !master.loopStartTime || !masterDuration) return { startAt: now, waitMs: 0 };
+  const masterElapsed = (now - master.loopStartTime) % masterDuration;
+  let toNext = masterDuration - masterElapsed;
+  if (toNext < 1e-6) toNext = 0;
+  const startAt = now + (toNext * divider);
+  return { startAt, waitMs: Math.round((startAt - now) * 1000) };
+}
+
+// Thorough AudioNode disposal helpers
+function safeDisconnect(node){
+  try { if (node && typeof node.disconnect === 'function') node.disconnect(); } catch(e){ }
+}
+function disposeEffectNodes(effect){
+  if (!effect || !effect.nodes) return;
+  try {
+    if (typeof effect.nodes.dispose === 'function') { effect.nodes.dispose(); }
+    else {
+      for (const k in effect.nodes) {
+        const n = effect.nodes[k];
+        if (n && typeof n.disconnect === 'function') n.disconnect();
+      }
+    }
+  } catch(err){ console.warn('dispose effect nodes failed', err); }
+  effect.nodes = null;
+}
+function disposeEffectNodesList(chain){
+  if (!Array.isArray(chain)) return;
+  for (const fx of chain) disposeEffectNodes(fx);
+}
+function disposeTrackNodes(lp){
+  try {
+    disposeEffectNodesList(lp.fx.chain);
+    safeDisconnect(lp.gainNode);
+    if (lp.sourceNode) { try { lp.sourceNode.stop(); } catch(e){}; safeDisconnect(lp.sourceNode); lp.sourceNode = null; }
+  } catch(e){ console.warn('disposeTrackNodes failed', e); }
+}
+
+// Reschedule other tracks when Track 1 changes
+function resyncAllTracksFromMaster(){
+  if (!masterIsSet || !loopers[1] || !loopers[1].loopBuffer) return;
+  const master = loopers[1];
+  masterLoopDuration = master.loopDuration;
+  master.loopStartTime = audioCtx.currentTime;
+  for (let i=2; i<=4; i++){
+    const lp = loopers[i];
+    if (!lp || !lp.loopBuffer) continue;
+    if (lp.state === 'playing' || lp.state === 'overdub'){
+      const relPos = ((audioCtx.currentTime - (lp.loopStartTime || audioCtx.currentTime)) % (lp.loopDuration || masterLoopDuration));
+      try { lp.stopPlayback(); } catch(_) {}
+      const now = audioCtx.currentTime;
+      const off = relPos % lp.loopDuration;
+      lp.loopStartTime = now - off;
+      lp.startPlayback();
+    }
+  }
+}
+
+// Per-track undo stack & helpers
+function pushUndoSnapshot(lp){
+  lp._undoStack = lp._undoStack || [];
+  const snapshot = {
+    buffer: lp.loopBuffer ? copyAudioBuffer(lp.loopBuffer) : null,
+    fxChain: JSON.parse(JSON.stringify(lp.fx.chain || [])),
+    timestamp: Date.now()
+  };
+  lp._undoStack.unshift(snapshot);
+  while (lp._undoStack.length > GLOBALS.UNDO_STACK_LIMIT) lp._undoStack.pop();
+}
+function undoLast(lp){
+  if (!lp._undoStack || !lp._undoStack.length) return false;
+  const snap = lp._undoStack.shift();
+  if (snap.buffer) lp.loopBuffer = snap.buffer;
+  lp.fx.chain = snap.fxChain;
+  if (lp.state === 'playing') lp.startPlayback();
+  renderTrackFxSummary(lp.index);
+  return true;
+}
+
+// Copy audio buffer (deep copy)
+function copyAudioBuffer(src){
+  if (!src) return null;
+  const out = audioCtx.createBuffer(src.numberOfChannels, src.length, src.sampleRate);
+  for (let ch=0; ch<src.numberOfChannels; ch++){
+    out.copyToChannel(src.getChannelData(ch).slice(0), ch, 0);
+  }
+  return out;
+}
+
+// WAV encoder (no CDN dependency)
+function encodeWavFromAudioBuffer(buf){
+  const numChannels = buf.numberOfChannels;
+  const sampleRate = buf.sampleRate;
+  const length = buf.length * numChannels * 2 + 44;
+  const ab = new ArrayBuffer(length);
+  const dv = new DataView(ab);
+  let offset = 0;
+  function writeString(s){ for (let i=0;i<s.length;i++) dv.setUint8(offset++, s.charCodeAt(i)); }
+  function writeInt16(v){ dv.setInt16(offset, v, true); offset += 2; }
+  function writeInt32(v){ dv.setUint32(offset, v, true); offset += 4; }
+
+  writeString('RIFF');
+  writeInt32(length - 8);
+  writeString('WAVE');
+  writeString('fmt ');
+  writeInt32(16); // PCM chunk size
+  writeInt16(1);  // PCM
+  writeInt16(numChannels);
+  writeInt32(sampleRate);
+  writeInt32(sampleRate * numChannels * 2);
+  writeInt16(numChannels * 2);
+  writeInt16(16);
+  writeString('data');
+  writeInt32(length - offset - 4);
+  const interleaved = new Float32Array(buf.length * numChannels);
+  let idx = 0;
+  for (let i=0;i<buf.length;i++){
+    for (let ch=0; ch<numChannels; ch++){
+      interleaved[idx++] = buf.getChannelData(ch)[i] || 0;
+    }
+  }
+  for (let i=0;i<interleaved.length;i++){
+    let s = Math.max(-1, Math.min(1, interleaved[i]));
+    dv.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([dv], { type: 'audio/wav' });
+}
+
 // ======= AUDIO SETUP =======
 async function ensureMic(){
-  // If micStream and micSource already initialized, nothing to do.
   if (micStream && micSource) return;
 
   if (audioCtx.state === 'suspended') {
@@ -123,12 +349,10 @@ async function ensureMic(){
   } catch(e){ showMsg('❌ Microphone access denied'); throw e; }
 
   micSource = audioCtx.createMediaStreamSource(micStream);
-  
-  // If the mic stream ends (user revoked / unplugged), cleanup
+
   micStream.getAudioTracks().forEach(t => {
     t.addEventListener('ended', () => {
       showMsg('⚠️ Microphone disconnected', '#ffb4a2');
-      // tear down nodes so ensureMic will re-init if needed
       try{ micSource.disconnect(); }catch{}; micSource = null;
       micStream = null;
     });
@@ -137,20 +361,17 @@ async function ensureMic(){
   dryGain = audioCtx.createGain();   dryGain.gain.value = 1;
   fxSumGain = audioCtx.createGain(); fxSumGain.gain.value = 1;
 
-  // --- Reverb path ---
   reverbPreDelay = audioCtx.createDelay(1.0); reverbPreDelay.delayTime.value = reverbPreDelayMs/1000;
   convolver = audioCtx.createConvolver(); convolver.normalize = true; convolver.buffer = makeReverbImpulse(reverbRoomSeconds, reverbDecay);
   reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0;
   micSource.connect(reverbPreDelay); reverbPreDelay.connect(convolver); convolver.connect(reverbWet); reverbWet.connect(fxSumGain);
 
-  // --- Delay path ---
   delayNode = audioCtx.createDelay(2.0);
   delayFeedback = audioCtx.createGain(); delayFeedback.gain.value = delayFeedbackAmt;
   delayWet = audioCtx.createGain(); delayWet.gain.value = 0;
   delayNode.connect(delayFeedback); delayFeedback.connect(delayNode);
   micSource.connect(delayNode); delayNode.connect(delayWet); delayWet.connect(fxSumGain);
 
-  // --- Flanger path ---
   flangerDelay = audioCtx.createDelay(0.05);
   flangerWet = audioCtx.createGain(); flangerWet.gain.value = 0;
   flangerFeedback = audioCtx.createGain(); flangerFeedback.gain.value = flangerFeedbackAmt;
@@ -161,33 +382,38 @@ async function ensureMic(){
   flangerDelay.connect(flangerFeedback); flangerFeedback.connect(flangerDelay);
   micSource.connect(flangerDelay); flangerLFO.start();
 
-  // EQ (created when toggled on)
   eq = null;
 
   micSource.connect(dryGain);
-
-  // Recording (processed stream intended for processed capture if needed)
   mixDest = audioCtx.createMediaStreamDestination();
   dryGain.connect(mixDest); fxSumGain.connect(mixDest);
   processedStream = mixDest.stream;
 
-  // ADDITION: MASTER BUS (final mix for export/listening)
   masterBus = audioCtx.createGain();
   masterBus.gain.value = 1;
-
-  // The master bus is only for the mix of the loops.
-  // We do NOT connect micSource/dryGain/fxSumGain to masterBus.
-  // This prevents the feedback loop from programmatic routing.
-  masterBus.connect(audioCtx.destination); // For listening
-  masterDest = audioCtx.createMediaStreamDestination(); // For recording
+  masterBus.connect(audioCtx.destination);
+  masterDest = audioCtx.createMediaStreamDestination();
   masterBus.connect(masterDest);
   masterStream = masterDest.stream;
 
-  // Live monitor (for user to hear mic while not overdubbing)
   liveMicMonitorGain = audioCtx.createGain(); liveMicMonitorGain.gain.value = 0;
   dryGain.connect(liveMicMonitorGain); fxSumGain.connect(liveMicMonitorGain); liveMicMonitorGain.connect(audioCtx.destination);
 
   hideMsg();
+}
+
+function ensureMasterBus(){
+  if (masterBus && masterDest && masterStream) return;
+  try {
+    masterBus = masterBus || audioCtx.createGain();
+    if (masterBus.gain.value === undefined || masterBus.gain.value === null) masterBus.gain.value = 1;
+    try { masterBus.connect(audioCtx.destination); } catch(e){ }
+    masterDest = masterDest || audioCtx.createMediaStreamDestination();
+    try { masterBus.connect(masterDest); } catch(e){ }
+    masterStream = masterDest.stream;
+  } catch (err) {
+    console.warn('ensureMasterBus failed', err);
+  }
 }
 
 function toggleEQ(enable){
@@ -224,7 +450,7 @@ const beforeFXBtns = {
   reverb: $('#fxBeforeBtn_reverb'),
   flanger:$('#fxBeforeBtn_flanger'),
   eq5:    $('#fxBeforeBtn_eq5'),
-  pitch:  $('#fxBeforeBtn_pitch') // live pitch shifting not implemented
+  pitch:  $('#fxBeforeBtn_pitch')
 };
 const fxBeforeParamsPopup = $('#fxBeforeParamsPopup');
 
@@ -345,7 +571,6 @@ function wireBeforeFxTab(tab){
 }
 
 function wireBeforeFX(){
-  // Toggle and open popup to tweak
   if (beforeFXBtns.reverb){
     addTap(beforeFXBtns.reverb, async ()=>{
       await ensureMic();
@@ -388,90 +613,107 @@ function wireBeforeFX(){
 }
 
 // ======= OFFLINE PITCH (worker-enabled) =======
-
-let __pitchWorker = null;
-function createPitchWorker(){
-  if (__pitchWorker) return __pitchWorker;
-  try {
-    const workerSrc = `
-      self.onmessage = function(e){
-        const { id, channels, sr, len, semitones, grainSize, hop } = e.data;
-        const ratio = Math.pow(2, semitones/12);
-        const win = new Float32Array(grainSize);
-        for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
-        const outLen = len;
-        const results = [];
-        for (let ch=0; ch<channels.length; ch++){
-          const inData = channels[ch];
-          const outData = new Float32Array(outLen);
-          for (let i=0;i<outLen;i++) outData[i]=0;
-          let readPos = 0;
-          for (let outPos = 0; outPos < outLen + hop; outPos += hop){
-            const rStart = Math.floor(readPos - grainSize/2);
-            for (let i=0;i<grainSize;i++){
-              const inIdx = rStart + i;
-              let s = 0;
-              if (inIdx >= 0 && inIdx < inData.length) s = inData[inIdx];
-              const w = win[i];
-              const target = outPos + i - Math.floor(grainSize/2);
-              if (target >= 0 && target < outLen){
-                outData[target] += s * w;
-              }
-            }
-            readPos += ratio * hop;
-            if (readPos > inData.length + grainSize) readPos = readPos % inData.length;
-          }
-          // envelope normalization
-          const envelope = new Float32Array(outLen);
-          for (let i=0;i<outLen;i++) envelope[i]=0;
-          for (let outPos = 0; outPos < outLen + hop; outPos += hop){
-            for (let i=0;i<grainSize;i++){
-              const target = outPos + i - Math.floor(grainSize/2);
-              if (target >= 0 && target < outLen) envelope[target] += win[i];
+const _pitchWorkerSrc = (grainSize) => `
+  self.onmessage = function(e){
+    const data = e.data;
+    if (data.cmd === 'process'){
+      const id = data.id, channels = data.channels, sr = data.sr, len = data.len,
+            semitones = data.semitones, grainSize = data.grainSize, hop = data.hop;
+      const ratio = Math.pow(2, semitones/12);
+      const win = new Float32Array(grainSize);
+      for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
+      const outLen = len;
+      const results = [];
+      for (let ch=0; ch<channels.length; ch++){
+        const inData = channels[ch];
+        const outData = new Float32Array(outLen);
+        for (let i=0;i<outLen;i++) outData[i]=0;
+        let readPos = 0;
+        let steps = Math.ceil((outLen + hop) / hop);
+        let stepIdx = 0;
+        for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+          const rStart = Math.floor(readPos - grainSize/2);
+          for (let i=0;i<grainSize;i++){
+            const inIdx = rStart + i;
+            let s = 0;
+            if (inIdx >= 0 && inIdx < inData.length) s = inData[inIdx];
+            const w = win[i];
+            const target = outPos + i - Math.floor(grainSize/2);
+            if (target >= 0 && target < outLen){
+              outData[target] += s * w;
             }
           }
-          for (let i=0;i<outLen;i++){
-            const env = envelope[i] || 1e-8;
-            outData[i] = outData[i] / env;
+          readPos += ratio * hop;
+          if (readPos > inData.length + grainSize) readPos = readPos % inData.length;
+          stepIdx++;
+          if (stepIdx % 32 === 0) {
+            self.postMessage({ cmd:'progress', id, pct: Math.min(1, outPos / outLen) });
           }
-          results.push(outData.buffer);
         }
-        // Transfer buffers back
-        self.postMessage({ id, sr, outLen, channels: results }, results);
-      };
-    `;
-    const blob = new Blob([workerSrc], { type: 'application/javascript' });
+        const envelope = new Float32Array(outLen);
+        for (let i=0;i<outLen;i++) envelope[i]=0;
+        for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+          for (let i=0;i<grainSize;i++){
+            const target = outPos + i - Math.floor(grainSize/2);
+            if (target >= 0 && target < outLen) envelope[target] += win[i];
+          }
+        }
+        for (let i=0;i<outLen;i++){
+          const env = envelope[i] || 1e-8;
+          outData[i] = outData[i] / env;
+        }
+        results.push(outData.buffer);
+      }
+      self.postMessage({ cmd:'done', id, sr, outLen, channels: results }, results);
+    } else if (data.cmd === 'cancel') {
+      self.postMessage({ cmd:'cancelled', id: data.id });
+    }
+  };
+`;
+
+function replaceWorkerAt(index){
+  try {
+    _pitchWorkerPool[index].worker.terminate();
+  } catch(e){}
+  const blob = new Blob([_pitchWorkerSrc(GLOBALS.PITCH_GRAIN_SIZE)], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  const w = new Worker(url); URL.revokeObjectURL(url);
+  _pitchWorkerPool[index] = { worker: w, busy: false };
+  w.onerror = (ev) => { console.error('pitch worker error', ev); try { replaceWorkerAt(index); } catch(e){} };
+}
+function createPitchWorkerPool(poolSize = GLOBALS.WORKER_POOL_SIZE){
+  const workers = [];
+  for (let i=0;i<poolSize;i++){
+    const blob = new Blob([_pitchWorkerSrc(GLOBALS.PITCH_GRAIN_SIZE)], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
-    __pitchWorker = new Worker(url);
+    const w = new Worker(url);
     URL.revokeObjectURL(url);
-    return __pitchWorker;
-  } catch (e){
-    console.warn('Pitch worker creation failed, falling back to main thread:', e);
-    __pitchWorker = null;
-    return null;
+    workers.push({ worker: w, busy: false });
   }
+  workers.forEach((p, idx) => p.worker.onerror = ()=> replaceWorkerAt(idx));
+  return workers;
 }
 
-// worker-backed pitch shift. Falls back to inline processing if worker unavailable.
-async function pitchShiftBufferOffline(inputBuffer, semitones){
-  if (!inputBuffer) return inputBuffer;
-  const sr = inputBuffer.sampleRate;
-  const channels = inputBuffer.numberOfChannels;
-  const len = inputBuffer.length;
-  const grainSize = 2048;
-  const hop = Math.floor(grainSize * 0.25);
+const _pitchWorkerPool = createPitchWorkerPool();
 
-  // Try worker
-  const worker = createPitchWorker();
-  if (worker){
-    return new Promise((resolve, reject) => {
-      const id = Math.random().toString(36).slice(2);
-      const channelArrays = [];
-      for (let ch=0; ch<channels; ch++) channelArrays.push(inputBuffer.getChannelData(ch).slice(0)); // copy
-      const onmsg = function(ev){
-        const d = ev.data || {};
-        const ok = (!d.id) || (d.id === id);
-        if (!ok) return;
+function submitPitchJobToPool(inputBuffer, semitones, onProgress = ()=>{}, timeoutMs = GLOBALS.PITCH_JOB_TIMEOUT_MS, grainSize = GLOBALS.PITCH_GRAIN_SIZE, hop = Math.max(1, Math.floor(grainSize * GLOBALS.PITCH_HOP_RATIO))){
+  const id = Math.random().toString(36).slice(2);
+  const channelsArrays = [];
+  for (let ch=0; ch<inputBuffer.numberOfChannels; ch++) channelsArrays.push(inputBuffer.getChannelData(ch).slice(0));
+  const poolItem = _pitchWorkerPool.find(w => !w.busy) || _pitchWorkerPool[0];
+  poolItem.busy = true;
+  const worker = poolItem.worker;
+
+  let finished = false;
+  let listener = null;
+  let timer = null;
+
+  const promise = new Promise((resolve, reject) => {
+    listener = (ev) => {
+      const d = ev.data || {};
+      if (d.id !== id && d.id !== undefined) return;
+      if (d.cmd === 'progress') onProgress(d.pct);
+      if (d.cmd === 'done') {
         try {
           const { channels: chBuffers, outLen, sr: outSR } = d;
           const outBuf = audioCtx.createBuffer(chBuffers.length, outLen, outSR);
@@ -479,32 +721,60 @@ async function pitchShiftBufferOffline(inputBuffer, semitones){
             const fa = new Float32Array(chBuffers[c]);
             outBuf.copyToChannel(fa, c, 0);
           }
-          worker.removeEventListener('message', onmsg);
+          finished = true;
+          worker.removeEventListener('message', listener);
+          poolItem.busy = false;
+          clearTimeout(timer);
           resolve(outBuf);
-        } catch (err){
-          worker.removeEventListener('message', onmsg);
+        } catch (err) {
+          poolItem.busy = false;
+          worker.removeEventListener('message', listener);
+          clearTimeout(timer);
           reject(err);
         }
-      };
-      worker.addEventListener('message', onmsg);
-      try {
-        const transfer = channelArrays.map(a=>a.buffer);
-        worker.postMessage({ id, channels: channelArrays, sr, len, semitones, grainSize, hop }, transfer);
-      } catch (err){
-        worker.removeEventListener('message', onmsg);
-        reject(err);
+      } else if (d.cmd === 'cancelled') {
+        finished = true;
+        poolItem.busy = false;
+        worker.removeEventListener('message', listener);
+        clearTimeout(timer);
+        reject(new Error('cancelled'));
       }
-    }).catch(async (e) => {
-      console.warn('Worker processing failed, falling back to main thread:', e);
-      return inlinePitchShift(inputBuffer, semitones, grainSize, hop);
-    });
-  } else {
-    // fallback
-    return inlinePitchShift(inputBuffer, semitones, grainSize, hop);
-  }
+    };
+    worker.addEventListener('message', listener);
+
+    timer = setTimeout(async ()=> {
+      if (finished) return;
+      worker.removeEventListener('message', listener);
+      poolItem.busy = false;
+      try {
+        const fallback = await inlinePitchShift(inputBuffer, semitones, grainSize, hop);
+        resolve(fallback);
+      } catch (e){
+        reject(e);
+      }
+    }, timeoutMs);
+
+    try {
+      const transfer = channelsArrays.map(a => a.buffer);
+      worker.postMessage({ cmd:'process', id, channels: channelsArrays, sr: inputBuffer.sampleRate, len: inputBuffer.length, semitones, grainSize, hop }, transfer);
+    } catch (err) {
+      clearTimeout(timer);
+      worker.removeEventListener('message', listener);
+      poolItem.busy = false;
+      inlinePitchShift(inputBuffer, semitones, grainSize, hop).then(resolve).catch(reject);
+    }
+  });
+
+  const cancel = () => {
+    try {
+      if (finished) return;
+      worker.postMessage({ cmd:'cancel', id });
+    } catch(e){ /* ignore */ }
+  };
+
+  return { promise, cancel };
 }
 
-// Inline fallback (your original algorithm extracted to a helper)
 async function inlinePitchShift(inputBuffer, semitones, grainSize=2048, hop=Math.floor(2048*0.25)){
   if (!inputBuffer) return inputBuffer;
   const ratio = Math.pow(2, semitones/12);
@@ -513,11 +783,8 @@ async function inlinePitchShift(inputBuffer, semitones, grainSize=2048, hop=Math
   const len = inputBuffer.length;
   const outLen = len;
   const output = audioCtx.createBuffer(channels, outLen, sr);
-
-  // Hann window
   const win = new Float32Array(grainSize);
   for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
-
   for (let ch=0; ch<channels; ch++){
     const inData = inputBuffer.getChannelData(ch);
     const outData = output.getChannelData(ch);
@@ -554,16 +821,25 @@ async function inlinePitchShift(inputBuffer, semitones, grainSize=2048, hop=Math
   return output;
 }
 
-// Apply Pitch After-FX to a Looper's loopBuffer (unchanged API, now worker-backed)
 async function applyPitchAfterFxToLoop(lp, semitones){
   if (!lp.loopBuffer) return;
-  lp.cancelPitchJob?.();
+  pushUndoSnapshot(lp);
+  lp.cancelPitchJob();
+  lp.uiDisabled = true;
+  lp.updateUI();
   showMsg(`⏳ Applying pitch ${semitones} st to Track ${lp.index}...`, '#ffd166');
-  const job = { cancelled:false, cancel(){ this.cancelled=true; terminatePitchWorker(); } };
-  lp._pitchJob = job;
+  
+  const bufLen = lp.loopBuffer.length;
+  let grain = GLOBALS.PITCH_GRAIN_SIZE;
+  if (bufLen < 22050) grain = 1024;
+  if (Math.abs(semitones) > 8) grain = Math.min(4096, grain * 2);
+  const hop = Math.max(1, Math.floor(grain * GLOBALS.PITCH_HOP_RATIO));
+
+  const jobHandle = submitPitchJobToPool(lp.loopBuffer, semitones, onProgress, undefined, grain, hop);
+  lp._pitchJob = jobHandle;
   try {
-    const newBuf = await pitchShiftBufferOffline(lp.loopBuffer, semitones);
-    if (job.cancelled) { showMsg('⚠️ Pitch cancelled', '#ffe066'); setTimeout(hideMsg,1000); return; }
+    const newBuf = await jobHandle.promise;
+    if (lp._pitchJob && lp._pitchJob.cancelled) { showMsg('⚠️ Pitch cancelled', '#ffe066'); lp._pitchJob = null; return; }
     lp._lastUnprocessedBuffer = lp.loopBuffer;
     lp.loopBuffer = newBuf;
     lp.loopDuration = newBuf.duration;
@@ -572,16 +848,30 @@ async function applyPitchAfterFxToLoop(lp, semitones){
     showMsg(`✅ Pitch applied (${semitones} st) to Track ${lp.index}`, '#a7ffed');
     setTimeout(hideMsg, 900);
   } catch (e){
-    if (job.cancelled) return;
+    if (lp._pitchJob && typeof lp._pitchJob.cancel === 'function') lp._pitchJob = null;
     console.error('Pitch processing failed', e);
     showMsg('❌ Pitch processing failed', '#ff6b6b');
     setTimeout(hideMsg, 1300);
   } finally {
-    lp._pitchJob = null;
+    lp.uiDisabled = false;
+    lp.updateUI();
   }
 }
-function terminatePitchWorker(){
-  if (__pitchWorker){ try{ __pitchWorker.terminate(); }catch{} __pitchWorker = null; }
+
+function showOfflineProgress(lpIndex, pct){
+  let el = document.getElementById('offlineProgress');
+  if (!el){
+    el = document.createElement('div'); el.id='offlineProgress';
+    Object.assign(el.style, { position:'fixed', left:'50%', bottom:'8%', transform:'translateX(-50%)', padding:'8px 12px', background:'#112', color:'#fff', borderRadius:'8px', zIndex:10001});
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `Track ${lpIndex} processing: ${(pct*100).toFixed(0)}% <button id="cancelPitchJobBtn">Cancel</button>`;
+  document.getElementById('cancelPitchJobBtn').onclick = ()=> {
+    const lp = loopers[lpIndex];
+    if (lp) lp.cancelPitchJob();
+    el.remove();
+  };
+  if (pct >= 0.999) setTimeout(()=>el.remove(), 800);
 }
 
 // ======= LOOPER (core) =======
@@ -590,7 +880,7 @@ class Looper {
     this.index = index;
     this.mainBtn = $('#mainLooperBtn'+index);
     this.stopBtn = $('#stopBtn'+index);
-    this.clearBtn = $('#clearBtn' + index); // New button reference
+    this.clearBtn = $('#clearBtn' + index);
     this.looperIcon = $('#looperIcon'+index);
     this.ledRing = $('#progressBar'+index);
     this.stateDisplay = $('#stateDisplay'+index);
@@ -603,8 +893,8 @@ class Looper {
     this.divider = 1; this.uiDisabled = false;
     this._pitchJob = null;
     this._lastUnprocessedBuffer = null;
+    this._undoStack = [];
 
-    // Track output gain
     this.gainNode = audioCtx.createGain();
     const volSlider = $('#volSlider'+index), volValue = $('#volValue'+index);
     this.gainNode.gain.value = 0.9;
@@ -613,7 +903,6 @@ class Looper {
       volSlider.addEventListener('input', ()=>{ const v=parseInt(volSlider.value,10); this.gainNode.gain.value=v/100; volValue.textContent=v+'%'; });
     }
 
-    // ===== After-FX chain state =====
     this.pitchSemitones = 0;
     this.fx = { chain: [], nextId: 1 };
 
@@ -624,8 +913,6 @@ class Looper {
       dividerSelectors[index].addEventListener('change', e => { this.divider = parseFloat(e.target.value); });
       this.disable(true);
     }
-
-    // Stop button logic (single click)
     if (this.stopBtn) {
       addTap(this.stopBtn, () => {
         if (this.state === 'playing' || this.state === 'overdub') this.stopPlayback();
@@ -633,21 +920,22 @@ class Looper {
         else if (this.state === 'recording') this.abortRecording();
       });
     }
-
-    // Clear button logic (single click)
     if (this.clearBtn) {
       addTap(this.clearBtn, () => this.clearLoop());
     }
-
     addTap(this.mainBtn, async () => {
       await ensureMic();
       await this.handleMainBtn();
     });
-
     const fxBtn = $('#fxMenuBtn' + index);
     if (fxBtn) fxBtn.addEventListener('click', () => openTrackFxMenu(this.index));
   }
-
+  cancelPitchJob(){
+    if (this._pitchJob){
+      try { this._pitchJob.cancel(); } catch(e){}
+      this._pitchJob = null;
+    }
+  }
   setLED(color){
     const map={green:'#22c55e', red:'#e11d48', orange:'#f59e0b', gray:'#6b7280'};
     this.ledRing.style.stroke=map[color]||'#fff';
@@ -660,7 +948,6 @@ class Looper {
   }
   setIcon(s,c){ this.looperIcon.textContent=s; if(c) this.looperIcon.style.color=c; }
   setDisplay(t){ this.stateDisplay.textContent=t; }
-
   updateUI(){
     switch(this.state){
       case 'ready':     this.setLED('green'); this.setRing(0); this.setIcon('▶'); this.setDisplay('Ready'); break;
@@ -687,79 +974,96 @@ class Looper {
       if (this.clearBtn) this.clearBtn.classList.remove('disabled-btn');
     }
   }
-
   disable(v){ this.uiDisabled=v; this.updateUI(); }
-
   async handleMainBtn(){
     if (this.state==='ready') await this.phaseLockedRecord();
     else if (this.state==='recording') await this.stopRecordingAndPlay();
     else if (this.state==='playing') this.armOverdub();
     else if (this.state==='overdub') this.finishOverdub();
   }
-
   async phaseLockedRecord(){
     await ensureMic();
     if (this.index===1 || !masterIsSet){ await this.startRecording(); return; }
     this.state='waiting'; this.updateUI();
-    const now = audioCtx.currentTime, master = loopers[1];
-    const elapsed = (now - master.loopStartTime) % masterLoopDuration;
-    const toNext = masterLoopDuration - elapsed;
-    setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
+    const { startAt, waitMs } = scheduleAtNextBar(masterLoopDuration, this.divider);
+    setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider, startAt); }, waitMs);
   }
-
-  async _startPhaseLockedRecording(len){
+  async _startPhaseLockedRecording(len, startAt){
     this.state='recording'; this.updateUI();
     this.chunks=[];
-    // Use ONLY raw mic stream for recording — do not fall back to the processed mix.
     const recStream = getRecordingStream();
     if (!recStream) {
-      showMsg('❌ Microphone not available for recording (start mic first)', '#ff6b6b');
+      showMsg('❌ Microphone not available for recording', '#ff6b6b');
       this.state = 'ready'; this.updateUI();
       return;
     }
     try {
-      this.mediaRecorder = new MediaRecorder(recStream);
-    } catch (e) {
-      console.error('MediaRecorder start failed', e);
-      showMsg('❌ Cannot start recorder', '#ff6b6b');
+      this.mediaRecorder = await startRecordingWithSafety(this, recStream, {
+        expectedMs: len * 1000,
+        onData: e => this.chunks.push(e.data),
+        onStop: async () => {
+          await this.stopRecordingAndPlay();
+        },
+        onError: e => {
+          this.state = 'ready'; this.updateUI();
+          this.setRing(0);
+        }
+      });
+      const self=this;
+      (function anim(){
+        if (self.state==='recording'){
+          const now = audioCtx.currentTime;
+          const pct = (now - startAt) / len;
+          self.setRing(Math.min(pct, 1));
+          if (pct < 1) requestAnimationFrame(anim);
+        }
+      })();
+    } catch(e){
+      console.error('Recording start failed', e);
       this.state = 'ready'; this.updateUI();
-      return;
+      this.setRing(0);
     }
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
-    const start=Date.now(), self=this;
-    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/(len*1000); self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
-    setTimeout(()=>{ if (this.state==='recording') self.stopRecordingAndPlay(); }, len*1000);
   }
-
   async startRecording(){
     await ensureMic();
     if (this.index>=2 && !masterIsSet) return;
     this.state='recording'; this.updateUI();
     this.chunks=[];
-    // Only allow raw mic recording for loops
     const recStream = getRecordingStream();
     if (!recStream) {
-      showMsg('❌ Microphone not available for recording (start mic first)', '#ff6b6b');
+      showMsg('❌ Microphone not available for recording', '#ff6b6b');
       this.state = 'ready'; this.updateUI();
       return;
     }
+    const maxDur = (this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
     try {
-      this.mediaRecorder = new MediaRecorder(recStream);
-    } catch (e) {
-      console.error('MediaRecorder start failed', e);
-      showMsg('❌ Cannot start recorder', '#ff6b6b');
+      this.mediaRecorder = await startRecordingWithSafety(this, recStream, {
+        expectedMs: maxDur,
+        onData: e => this.chunks.push(e.data),
+        onStop: async () => {
+          await this.stopRecordingAndPlay();
+        },
+        onError: e => {
+          this.state = 'ready'; this.updateUI();
+          this.setRing(0);
+        }
+      });
+      const start = Date.now(), self=this;
+      (function anim(){
+        if (self.state==='recording'){
+          const pct = (Date.now() - start) / maxDur;
+          self.setRing(Math.min(pct, 1));
+          if (pct < 1) requestAnimationFrame(anim);
+        }
+      })();
+    } catch(e){
+      console.error('Recording start failed', e);
       this.state = 'ready'; this.updateUI();
-      return;
+      this.setRing(0);
     }
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
-    const start=Date.now(), self=this; const max=(this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
-    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/max; self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
   }
-
   async stopRecordingAndPlay(){
-    if (!this.mediaRecorder) return;
+    if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') return;
     this.state='playing'; this.updateUI();
     this.mediaRecorder.onstop = async ()=>{
       const blob=new Blob(this.chunks,{type:'audio/webm'}); const buf=await blob.arrayBuffer();
@@ -772,6 +1076,7 @@ class Looper {
           updateDelayFromTempo();
           masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
           for (let k=2;k<=4;k++) loopers[k].disable(false);
+          resyncAllTracksFromMaster();
         }
         this.startPlayback();
       } catch (e) {
@@ -782,25 +1087,21 @@ class Looper {
     };
     this.mediaRecorder.stop();
   }
-
   abortRecording(){
     if (this.mediaRecorder && this.state==='recording'){
       try {
         this.mediaRecorder.ondataavailable = null;
         this.mediaRecorder.onstop = null;
-        this.mediaRecorder.stop();
+        if (this.mediaRecorder.state === 'recording') this.mediaRecorder.stop();
       } catch {}
+      try { releaseRecLock(); } catch {}
       this.mediaRecorder=null; this.chunks=[]; this.state='ready'; this.loopBuffer=null; this.loopDuration=0; this.setRing(0); this.updateUI();
     }
   }
-
   _applyPitchIfAny(){
-    // Old behavior (playbackRate) removed — replaced by offline processing.
-    // This function intentionally does nothing now.
   }
-
   _buildEffectNodes(effect){
-    if (effect.nodes?.dispose){ try{ effect.nodes.dispose(); }catch{} }
+    disposeEffectNodes(effect);
     if (effect.type==='LowPass'){
       const input = audioCtx.createGain(), biq = audioCtx.createBiquadFilter(), output = audioCtx.createGain();
       biq.type='lowpass'; input.connect(biq); biq.connect(output); biq.frequency.value = effect.params.cutoff; biq.Q.value = effect.params.q;
@@ -826,31 +1127,30 @@ class Looper {
       comp.threshold.value = effect.params.threshold; comp.knee.value = effect.params.knee; comp.ratio.value = effect.params.ratio; comp.attack.value = effect.params.attack; comp.release.value = effect.params.release;
       effect.nodes = { input, output, comp, dispose(){ try{input.disconnect(); comp.disconnect(); output.disconnect();}catch{} } };
     } else if (effect.type==='Pitch'){
-      // Pitch is handled offline — no runtime nodes required
       effect.nodes = { input:null, output:null, dispose(){} };
     }
   }
-
   _rebuildChainWiring(){
     if (!this.sourceNode) return;
     try{ this.sourceNode.disconnect(); }catch{}
     try{ this.gainNode.disconnect(); }catch{}
-    this._applyPitchIfAny(); // no-op now
+    this._applyPitchIfAny();
     let head = this.sourceNode;
-    for (const fx of this.fx.chain){ if (fx.type!=='Pitch') this._buildEffectNodes(fx); }
+    disposeEffectNodesList(this.fx.chain);
+    for (const fx of this.fx.chain){
+      if (fx.type!=='Pitch') this._buildEffectNodes(fx);
+    }
     for (const fx of this.fx.chain){
       if (fx.type==='Pitch' || !fx.nodes) continue;
       if (!fx.bypass){ try{ head.connect(fx.nodes.input); }catch{}; head = fx.nodes.output; }
     }
     try{ head.connect(this.gainNode); }catch{}
-    // Connect to masterBus (master mix)
     if (!masterBus){
       console.warn('masterBus missing; creating on demand');
       ensureMasterBus();
     }
     this.gainNode.connect(masterBus);
   }
-
   startPlayback(){
     if (!this.loopBuffer) return;
     if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} }
@@ -858,8 +1158,9 @@ class Looper {
     this.sourceNode.buffer = this.loopBuffer; this.sourceNode.loop = true;
     let off=0;
     if (this.index!==1 && masterIsSet && loopers[1].sourceNode && masterLoopDuration>0){
-      const master = loopers[1]; const now = audioCtx.currentTime - master.loopStartTime;
-      off = now % masterLoopDuration; if (isNaN(off)||off<0||off>this.loopBuffer.duration) off=0;
+      const master = loopers[1]; const now = audioCtx.currentTime;
+      off = (now - master.loopStartTime)%masterLoopDuration;
+      if (isNaN(off)||off<0||off>this.loopBuffer.duration) off=0;
     }
     this.loopStartTime = audioCtx.currentTime - off;
     this._rebuildChainWiring();
@@ -867,128 +1168,95 @@ class Looper {
     this.state='playing'; this.updateUI(); this._animate();
     renderTrackFxSummary(this.index);
   }
-
   resumePlayback(){
     if (this.index===1){
       this.startPlayback();
       for (let k=2;k<=4;k++) if (loopers[k].state==='playing') loopers[k].startPlayback();
     } else { this.startPlayback(); }
   }
-
   stopPlayback(){ if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} } this.state='stopped'; this.updateUI(); }
-
   armOverdub(){
     if (this.state!=='playing') return;
     if (!this.loopDuration || this.loopDuration <= 0){
-      // can't overdub without a valid loop duration
       showMsg('❌ Loop duration invalid — cannot overdub', '#ff6b6b');
       setTimeout(hideMsg, 1000);
       return;
     }
-
     this.state='overdub'; this.updateUI();
-
     const now = audioCtx.currentTime;
-    // protect against NaN from loopStartTime
     const elapsed = isFinite(now - this.loopStartTime) ? (now - this.loopStartTime) % this.loopDuration : 0;
-    // ensure toNext is in [0, loopDuration)
     let toNext = this.loopDuration - elapsed;
     if (!isFinite(toNext) || toNext < 0) toNext = 0;
     setTimeout(()=>this.startOverdubRecording(), toNext * 1000);
   }
-
-  startOverdubRecording(){
-    // Prepare: mute master/monitor to avoid acoustic bleed into mic (if option enabled)
-    if (AUTO_MUTE_MONITOR_ON_OVERDUB){
-      this._prevMasterGain = masterBus ? masterBus.gain.value : 1;
-      if (masterBus) masterBus.gain.setValueAtTime(0, audioCtx.currentTime);
-      this._prevLiveMonGain = liveMicMonitorGain ? liveMicMonitorGain.gain.value : 0;
-      if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
-    }
-
+  async startOverdubRecording(){
+    muteForOverdub(this);
     this.overdubChunks = [];
-
-    // Must record only the mic — no fallback to processedStream allowed
     const recStream = getRecordingStream();
     if (!recStream) {
-      // restore monitor/master if we muted it earlier
-      if (AUTO_MUTE_MONITOR_ON_OVERDUB){
-        if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
-        if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
-      }
+      restoreAfterOverdub(this);
       showMsg('❌ Microphone not available for overdub', '#ff6b6b');
       this.state = 'playing'; this.updateUI();
       return;
     }
-    const recMime = pickAudioMime();
     try {
-      this.mediaRecorder = recMime ? new MediaRecorder(recStream, { mimeType: recMime }) : new MediaRecorder(recStream);
-    } catch (e) {
-      console.error('MediaRecorder start failed', e);
-      // restore monitor/master
-      if (AUTO_MUTE_MONITOR_ON_OVERDUB){
-        if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
-        if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
-      }
+      this.mediaRecorder = await startRecordingWithSafety(this, recStream, {
+        expectedMs: this.loopDuration * 1000,
+        onData: e => this.overdubChunks.push(e.data),
+        onStop: async () => {
+          await this.finishOverdub();
+        },
+        onError: e => {
+          restoreAfterOverdub(this);
+          this.state = 'playing'; this.updateUI();
+        }
+      });
+      const d = (this.loopDuration && this.loopDuration > 0) ? this.loopDuration : 0.001;
+    } catch(e){
+      console.error('Overdub recorder start failed', e);
+      restoreAfterOverdub(this);
       showMsg('❌ Cannot start overdub recorder', '#ff6b6b');
       this.state = 'playing'; this.updateUI();
       return;
     }
-
-    this.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) this.overdubChunks.push(e.data); };
-    this.mediaRecorder.start();
-    // guard timeout: ensure a minimal positive timeout if loopDuration missing
-    const d = (this.loopDuration && this.loopDuration > 0) ? this.loopDuration : 0.001;
-    setTimeout(()=>this.finishOverdub(), d * 1000);
   }
-
-  finishOverdub(){
-    if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
-      // restore monitor before decoding & playback so user hears final result
-      const restoreMonitor = ()=>{
-        if (AUTO_MUTE_MONITOR_ON_OVERDUB){
-          if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
-          if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
-        }
-      };
-
-      this.mediaRecorder.onstop = async ()=>{
-        try {
-          const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
-          const newBuf = await decodeAudioBuffer(arr);
-          if (!this.loopBuffer){
-            // if no previous loop (shouldn't happen for overdub) just assign
-            this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreMonitor(); this.startPlayback(); return;
-          }
-          const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
-          const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
-          const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
-          for (let ch=0; ch<outC; ch++){
-            const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
-            for (let i=0;i<length;i++){
-              const ov = o ? (o[i] || 0) : 0;
-              const nv = n ? (n[i] || 0) : 0;
-              outD[i] = ov + nv;
-            }
-          }
-          // assign and restart playback
-          this.loopBuffer = out; this.loopDuration = out.duration;
-          restoreMonitor();
-          this.startPlayback();
-        } catch (e){
-          console.error('Overdub decode error', e);
-          restoreMonitor();
-          this.state='playing'; this.updateUI();
-        }
-      };
-      this.mediaRecorder.stop();
-    } else {
-      this.state='playing'; this.updateUI();
+  async finishOverdub(){
+    if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
+        this.state='playing'; this.updateUI();
+        restoreAfterOverdub(this);
+        return;
     }
+    this.mediaRecorder.onstop = async ()=>{
+      try {
+        const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
+        const newBuf = await decodeAudioBuffer(arr);
+        if (!this.loopBuffer){
+          this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreAfterOverdub(this); this.startPlayback(); return;
+        }
+        const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
+        const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
+        const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
+        for (let ch=0; ch<outC; ch++){
+          const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
+          for (let i=0;i<length;i++){
+            const ov = o ? (o[i] || 0) : 0;
+            const nv = n ? (n[i] || 0) : 0;
+            outD[i] = ov + nv;
+          }
+        }
+        this.loopBuffer = out; this.loopDuration = out.duration;
+        restoreAfterOverdub(this);
+        this.startPlayback();
+      } catch (e){
+        console.error('Overdub decode error', e);
+        restoreAfterOverdub(this);
+        this.state='playing'; this.updateUI();
+      }
+    };
+    this.mediaRecorder.stop();
   }
-
   clearLoop(){
-    if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} }
+    disposeTrackNodes(this);
     this.loopBuffer=null; this.loopDuration=0; this.state='ready'; this.updateUI();
     if (this.index===1){
       masterLoopDuration=null; masterBPM=null; masterIsSet=false; bpmLabel.textContent='BPM: --';
@@ -997,7 +1265,6 @@ class Looper {
       updateDelayFromTempo();
     }
   }
-
   _animate(){
     if (this.state==='playing' && this.loopDuration>0 && this.sourceNode){
       const now = audioCtx.currentTime; const pos=(now - this.loopStartTime)%this.loopDuration;
@@ -1005,16 +1272,15 @@ class Looper {
     } else { this.setRing(0); }
   }
 }
-
 window.addEventListener('beforeunload', () => {
-  try { __pitchWorker?.terminate(); } catch (e) {}
+  try {
+    for (const p of _pitchWorkerPool) try { p.worker.terminate(); } catch(e){}
+  } catch(e){}
+  try { releaseRecLock(); } catch(e){}
 });
-
-// ======= BUILD LOOPERS + KEYBINDS =======
 const keyMap = [{rec:'w',stop:'s'},{rec:'e',stop:'d'},{rec:'r',stop:'f'},{rec:'t',stop:'g'}];
 window.loopers = [];
 for (let i=1;i<=4;i++) loopers[i] = new Looper(i, keyMap[i-1].rec, keyMap[i-1].stop);
-
 document.addEventListener('keydown', e=>{
   const k=e.key.toLowerCase();
   loopers.forEach((lp, idx)=>{
@@ -1028,11 +1294,8 @@ document.addEventListener('keydown', e=>{
     }
   });
 });
-
-// ======= AFTER-FX: MENU + PARAM POPUPS + REORDER =======
 const fxMenuPopup   = $('#fxMenuPopup');
 const fxParamsPopup = $('#fxParamsPopup');
-
 const AFTER_FX_CATALOG = [
   { type:'Pitch',      name:'Pitch (Offline)', defaults:{ semitones:0 } },
   { type:'LowPass',    name:'Low-pass Filter',      defaults:{ cutoff:12000, q:0.7 } },
@@ -1041,7 +1304,6 @@ const AFTER_FX_CATALOG = [
   { type:'Delay',      name:'Delay (Insert)',       defaults:{ timeSec:0.25, feedback:0.25, mix:0.25 } },
   { type:'Compressor', name:'Compressor',           defaults:{ threshold:-18, knee:6, ratio:3, attack:0.003, release:0.25 } },
 ];
-
 function addEffectToTrack(lp, type){
   const meta = AFTER_FX_CATALOG.find(x=>x.type===type);
   if (!meta) return;
@@ -1050,10 +1312,8 @@ function addEffectToTrack(lp, type){
   lp.fx.chain.push(eff);
   if (lp.state==='playing') lp._rebuildChainWiring();
   renderTrackFxSummary(lp.index);
-  // If this is a Pitch effect and we already have buffer, apply it right away
   if (type==='Pitch' && lp.loopBuffer) applyPitchAfterFxToLoop(lp, eff.params.semitones);
 }
-
 function moveEffect(lp, id, dir){
   const i = lp.fx.chain.findIndex(e=>e.id===id); if (i<0) return;
   const j = i + (dir==='up'?-1:+1);
@@ -1063,29 +1323,25 @@ function moveEffect(lp, id, dir){
   if (lp.state==='playing') lp._rebuildChainWiring();
   openTrackFxMenu(lp.index);
 }
-
 function removeEffect(lp, id){
   const i = lp.fx.chain.findIndex(e=>e.id===id); if (i<0) return;
   const [ fx ] = lp.fx.chain.splice(i,1);
-  try{ fx.nodes?.dispose?.(); }catch{}
+  disposeEffectNodes(fx);
   if (fx.type==='Pitch') lp.pitchSemitones = 0;
   if (lp.state==='playing') lp._rebuildChainWiring();
   openTrackFxMenu(lp.index);
 }
-
 function toggleBypass(lp, id){
   const fx = lp.fx.chain.find(e=>e.id===id); if (!fx) return;
   fx.bypass = !fx.bypass;
   if (lp.state==='playing') lp._rebuildChainWiring();
   openTrackFxMenu(lp.index);
 }
-
 function renderTrackFxSummary(idx){
   const lp = loopers[idx]; const el = $('#trackFxLabels'+idx); if (!lp || !el) return;
   if (!lp.fx.chain.length){ el.textContent=''; return; }
   el.textContent = lp.fx.chain.map((e,i)=> `${i+1}.${e.type === 'Pitch' ? `Pitch ${e.params.semitones>0?'+':''}${e.params.semitones}` : e.name}`).join(' → ');
 }
-
 function openTrackFxMenu(idx){
   const lp = loopers[idx]; if (!lp) return;
   fxMenuPopup.classList.remove('hidden');
@@ -1121,7 +1377,6 @@ function openTrackFxMenu(idx){
   $('#closeFxMenu').addEventListener('click', ()=> fxMenuPopup.classList.add('hidden'));
   renderTrackFxSummary(idx);
 }
-
 function openFxParamsPopup(idx, id){
   const lp = loopers[idx]; if (!lp) return;
   const fx = lp.fx.chain.find(e=>e.id===id); if (!fx) return;
@@ -1137,7 +1392,6 @@ function openFxParamsPopup(idx, id){
   wireFxParams(lp, fx);
   $('#closeFxParams').addEventListener('click', ()=> fxParamsPopup.classList.add('hidden'));
 }
-
 function renderFxParamsBody(fx){
   switch(fx.type){
     case 'Pitch': return `<label>Semi-tones <span id="pSemVal">${fx.params.semitones}</span><input id="pSem" type="range" min="-12" max="12" step="1" value="${fx.params.semitones}"></label>`;
@@ -1149,7 +1403,6 @@ function renderFxParamsBody(fx){
   }
   return `<div class="small">No params.</div>`;
 }
-
 function wireFxParams(lp, fx){
   if (fx.type==='Pitch'){
     $('#pSem').addEventListener('input', e=>{
@@ -1157,7 +1410,6 @@ function wireFxParams(lp, fx){
       $('#pSemVal').textContent = fx.params.semitones;
       lp.pitchSemitones = fx.params.semitones;
       renderTrackFxSummary(lp.index);
-      // Apply offline pitch processing when user changes semitones (async)
       if (lp.loopBuffer) {
         applyPitchAfterFxToLoop(lp, fx.params.semitones);
       }
@@ -1169,8 +1421,6 @@ function wireFxParams(lp, fx){
   if (fx.type==='Delay'){ $('#dTime').addEventListener('input', e=>{ fx.params.timeSec = parseInt(e.target.value,10)/1000; $('#dTimeVal').textContent = `${parseInt(e.target.value,10)} ms`; if (fx.nodes?.d) fx.nodes.d.delayTime.setTargetAtTime(fx.params.timeSec, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#dFb').addEventListener('input', e=>{ fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01); }); $('#dMix').addEventListener('input', e=>{ fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.wet) fx.nodes.wet.gain.setTargetAtTime(clamp(fx.params.mix,0,1), audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Compressor'){ $('#cTh').addEventListener('input', e=>{ fx.params.threshold = parseInt(e.target.value,10); $('#cThVal').textContent = fx.params.threshold+' dB'; if (fx.nodes?.comp) fx.nodes.comp.threshold.setTargetAtTime(fx.params.threshold, audioCtx.currentTime, 0.01); }); $('#cRa').addEventListener('input', e=>{ fx.params.ratio = parseFloat(e.target.value); $('#cRaVal').textContent = fx.params.ratio+':1'; if (fx.nodes?.comp) fx.nodes.comp.ratio.setTargetAtTime(fx.params.ratio, audioCtx.currentTime, 0.01); }); $('#cKn').addEventListener('input', e=>{ fx.params.knee = parseInt(e.target.value,10); $('#cKnVal').textContent = fx.params.knee+' dB'; if (fx.nodes?.comp) fx.nodes.comp.knee.setTargetAtTime(fx.params.knee, audioCtx.currentTime, 0.01); }); $('#cAt').addEventListener('input', e=>{ fx.params.attack = parseFloat(e.target.value)/1000; $('#cAtVal').textContent = (fx.params.attack*1000).toFixed(1)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.attack.setTargetAtTime(fx.params.attack, audioCtx.currentTime, 0.01); }); $('#cRl').addEventListener('input', e=>{ fx.params.release = parseFloat(e.target.value)/1000; $('#cRlVal').textContent = (fx.params.release*1000).toFixed(0)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.release.setTargetAtTime(fx.params.release, audioCtx.currentTime, 0.01); }); }
 }
-
-// ======= LIVE MIC BUTTON =======
 const monitorBtn = $('#monitorBtn');
 if (monitorBtn){
   monitorBtn.addEventListener('click', async ()=>{
@@ -1182,20 +1432,14 @@ if (monitorBtn){
   });
   monitorBtn.textContent='Live MIC OFF';
 }
-
-// ======= BEFORE-FX WIRING & AUDIO UNLOCK =======
 wireBeforeFX();
-
 function resumeAudio(){ if (audioCtx.state==='suspended'){ audioCtx.resume(); hideMsg(); } }
 window.addEventListener('click', resumeAudio, { once:true });
 window.addEventListener('touchstart', resumeAudio, { once:true });
 if (audioCtx.state==='suspended'){
   showMsg("👆 Tap anywhere to start audio!<br>Then toggle Before-FX and tweak in the popup. For per-track FX: use 🎛 FX Menu.", "#22ff88");
 }
-
-// ======= ADDITION: MASTER MIX RECORDER =======
 let mixRecorder = null, mixChunks = [], mixRecording = false;
-
 function setMixButton(on){
   const b = document.getElementById('mixRecBtn');
   if (!b) return;
@@ -1203,16 +1447,14 @@ function setMixButton(on){
   b.textContent = on ? '■ Stop & Save' : '● Record Mix';
   b.classList.toggle('active', on);
 }
-
 async function startMasterRecording(){
-  await ensureMic(); // make sure masterStream exists
+  await ensureMic();
   if (!masterStream){
     showMsg('❌ Master stream not available'); return;
   }
-  const recMime = pickAudioMime();
   try {
     mixChunks = [];
-    mixRecorder = recMime ? new MediaRecorder(masterStream, { mimeType: recMime }) : new MediaRecorder(masterStream);
+    mixRecorder = new MediaRecorder(masterStream, { mimeType: pickAudioMime() });
     mixRecorder.ondataavailable = (e)=>{ if (e.data?.size) mixChunks.push(e.data); };
     mixRecorder.onstop = async ()=>{ await saveMasterRecording(); };
     mixRecorder.start();
@@ -1223,116 +1465,50 @@ async function startMasterRecording(){
     showMsg('❌ Cannot start master recording'); console.error(e);
   }
 }
-
 async function stopMasterRecording(){
   if (mixRecorder && mixRecorder.state !== 'inactive'){
     try { mixRecorder.stop(); } catch {}
   }
   setMixButton(false);
 }
-
 async function blobToArrayBuffer(blob){
   return await new Response(blob).arrayBuffer();
 }
-
-// Helper to pick a compatible audio mimetype
-function pickAudioMime(){
-  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
-  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
-  if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) return 'audio/ogg;codecs=opus';
-  return '';
-}
-
-async function encodeMp3FromWebm(webmBlob){
-  // Try dynamic load of lamejs (CDN). If blocked, return null and we’ll fall back to webm.
-  function loadLame(){
-    return new Promise((resolve,reject)=>{
-      if (window.lamejs) return resolve();
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/lamejs@1.2.0/lame.min.js';
-      s.onload = ()=>resolve();
-      s.onerror = ()=>reject(new Error('lamejs load failed'));
-      document.head.appendChild(s);
-    });
-  }
-
-  try{
-    await loadLame();
-  }catch{
-    return null; // fallback to WebM save
-  }
-
-  // Decode webm -> PCM via WebAudio, then encode MP3
-  const arr = await blobToArrayBuffer(webmBlob);
-  const audioBuf = await decodeAudioBuffer(arr);
-
-  const numCh = audioBuf.numberOfChannels;
-  const sr = audioBuf.sampleRate;
-  const left = audioBuf.getChannelData(0);
-  const right = numCh > 1 ? audioBuf.getChannelData(1) : null;
-
-  const mp3enc = new lamejs.Mp3Encoder(numCh, sr, 128); // 128 kbps
-  const blockSize = 1152;
-  let mp3Data = [];
-
-  // Interleave to Int16 per channel
-  function floatTo16BitPCM(input){
-    const out = new Int16Array(input.length);
-    for (let i=0;i<input.length;i++){
-      const s = Math.max(-1, Math.min(1, input[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return out;
-  }
-
-  const left16 = floatTo16BitPCM(left);
-  const right16 = right ? floatTo16BitPCM(right) : null;
-
-  for (let i=0;i<left16.length;i+=blockSize){
-    const l = left16.subarray(i, i+blockSize);
-    const r = right16 ? right16.subarray(i, i+blockSize) : null;
-    const enc = numCh===2 ? mp3enc.encodeBuffer(l, r) : mp3enc.encodeBuffer(l);
-    if (enc.length) mp3Data.push(enc);
-  }
-  const end = mp3enc.flush();
-  if (end.length) mp3Data.push(end);
-  return new Blob(mp3Data, { type: 'audio/mpeg' });
-}
-
 async function saveMasterRecording(){
   const webmBlob = new Blob(mixChunks, { type:'audio/webm' });
-
-  // Ask user: try MP3?
-  const wantMp3 = confirm('Stop recorded. Export as MP3?\n(OK = MP3, Cancel = WebM)');
-
-  if (wantMp3){
-    const mp3 = await encodeMp3FromWebm(webmBlob);
-    if (mp3){
+  const wantWav = confirm('Save master mix as WAV? OK = WAV (uncompressed), Cancel = WebM');
+  if (wantWav){
+    try {
+      const arr = await blobToArrayBuffer(webmBlob);
+      const audioBuf = await decodeAudioBuffer(arr);
+      const wavBlob = encodeWavFromAudioBuffer(audioBuf);
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(mp3);
-      a.download = `looper-mix-${Date.now()}.mp3`;
+      a.href = URL.createObjectURL(wavBlob);
+      a.download = `looper-mix-${Date.now()}.wav`;
       a.click();
       URL.revokeObjectURL(a.href);
-      showMsg('✅ Saved MP3 to downloads', '#a7ffed');
+      showMsg('✅ Saved WAV mix to downloads', '#a7ffed');
       setTimeout(hideMsg, 1500);
       return;
-    } else {
-      showMsg('⚠️ MP3 encoder unavailable, saving WebM instead', '#ffe066');
-      setTimeout(hideMsg, 1600);
+    } catch(e){
+      console.warn('WAV export failed, falling back to WebM', e);
     }
   }
-
-  // Fallback: save WebM
   const a = document.createElement('a');
   a.href = URL.createObjectURL(webmBlob);
   a.download = `looper-mix-${Date.now()}.webm`;
   a.click();
   URL.revokeObjectURL(a.href);
-  showMsg('✅ Saved WebM to downloads', '#a7ffed');
+  showMsg('✅ Saved WebM mix to downloads', '#a7ffed');
   setTimeout(hideMsg, 1500);
 }
-
-// Global helper to handle both Promise and callback decodeAudioData
+const mixBtn = document.getElementById('mixRecBtn');
+if (mixBtn){
+  mixBtn.addEventListener('click', async () => {
+    if (!mixRecording) await startMasterRecording();
+    else await stopMasterRecording();
+  });
+}
 function decodeAudioBuffer(arrayBuffer){
   return new Promise((resolve, reject) => {
     try {
