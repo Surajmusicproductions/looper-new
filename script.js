@@ -41,6 +41,11 @@ let liveMicMonitorGain = null, liveMicMonitoring = false;
 // Master timing from track 1
 let masterLoopDuration = null, masterBPM = null, masterIsSet = false;
 
+// AudioWorklet for recording
+let recorderNode = null;
+const audioChunks = [];
+let isRecording = false;
+
 // ======= DOM SHORTCUTS =======
 const $ = s => document.querySelector(s);
 const bpmLabel = $('#bpmLabel');
@@ -130,10 +135,22 @@ async function ensureMic(){
 
   micSource.connect(dryGain);
 
-  // Recording
-  mixDest = audioCtx.createMediaStreamDestination();
-  dryGain.connect(mixDest); fxSumGain.connect(mixDest);
-  processedStream = mixDest.stream;
+  // AudioWorklet for recording
+  try {
+    await audioCtx.audioWorklet.addModule('recorder-worklet.js');
+    recorderNode = new AudioWorkletNode(audioCtx, 'recorder-processor');
+    recorderNode.port.onmessage = (e) => {
+        if (e.data.audioData) {
+            audioChunks.push(e.data.audioData);
+        }
+    };
+    dryGain.connect(recorderNode);
+    fxSumGain.connect(recorderNode);
+  } catch(e) {
+    showMsg(`❌ Could not load AudioWorklet: ${e.message}`);
+    console.error("AudioWorklet module failed to load:", e);
+    return;
+  }
 
   // Live monitor
   liveMicMonitorGain = audioCtx.createGain(); liveMicMonitorGain.gain.value = 0;
@@ -168,6 +185,11 @@ function updateDelayFromTempo(){
   const q = quarterSecForBPM(masterBPM || 120);
   const mult = applyVariant(NOTE_MULT[delayDivision]||0.5, delayVariant);
   delayNode.delayTime.value = clamp(q*mult, 0.001, 2.0);
+}
+
+// Clamp feedback gain to prevent self-oscillation
+function clampFeedback(gainValue, maxGain=0.95) {
+    return clamp(gainValue, -maxGain, maxGain);
 }
 
 // ======= BEFORE-FX BUTTONS + POPUP =======
@@ -272,14 +294,14 @@ function wireBeforeFxTab(tab){
     $('#dlDiv').addEventListener('change', e=>{ delayDivision = e.target.value; updateDelayFromTempo(); });
     $('#dlVar').addEventListener('change', e=>{ delayVariant = e.target.value; updateDelayFromTempo(); });
     $('#dlMs').addEventListener('input', e=>{ delayMs = parseInt(e.target.value,10); if (delaySyncMode==='ms') delayNode.delayTime.value = clamp(delayMs/1000,0,2); $('#dlMsVal').textContent = delayMs+' ms'; });
-    $('#dlFb').addEventListener('input', e=>{ delayFeedbackAmt = parseFloat(e.target.value)/100; delayFeedback.gain.value = clamp(delayFeedbackAmt,0,0.95); $('#dlFbVal').textContent = Math.round(delayFeedbackAmt*100)+'%'; });
+    $('#dlFb').addEventListener('input', e=>{ delayFeedbackAmt = parseFloat(e.target.value)/100; delayFeedback.gain.value = clampFeedback(delayFeedbackAmt); $('#dlFbVal').textContent = Math.round(delayFeedbackAmt*100)+'%'; });
     $('#dlMix').addEventListener('input', e=>{ delayMix = parseFloat(e.target.value)/100; delayWet.gain.value = beforeState.delay ? delayMix : 0; $('#dlMixVal').textContent = Math.round(delayMix*100)+'%'; });
     syncUI();
   }
   if (tab==='flanger'){
     $('#flRate').addEventListener('input', e=>{ flangerRateHz = parseFloat(e.target.value); flangerLFO.frequency.value = flangerRateHz; $('#flRateVal').textContent = flangerRateHz.toFixed(2)+' Hz'; });
     $('#flDepth').addEventListener('input', e=>{ flangerDepthMs = parseFloat(e.target.value); flangerDepthGain.gain.value = flangerDepthMs/1000; $('#flDepthVal').textContent = flangerDepthMs.toFixed(2)+' ms'; });
-    $('#flFb').addEventListener('input', e=>{ flangerFeedbackAmt = parseFloat(e.target.value)/100; flangerFeedback.gain.value = clamp(flangerFeedbackAmt, -0.95, 0.95); $('#flFbVal').textContent = Math.round(flangerFeedbackAmt*100)+'%'; });
+    $('#flFb').addEventListener('input', e=>{ flangerFeedbackAmt = parseFloat(e.target.value)/100; flangerFeedback.gain.value = clampFeedback(flangerFeedbackAmt); $('#flFbVal').textContent = Math.round(flangerFeedbackAmt*100)+'%'; });
     $('#flMix').addEventListener('input', e=>{ flangerMix = parseFloat(e.target.value)/100; flangerWet.gain.value = beforeState.flanger ? flangerMix : 0; $('#flMixVal').textContent = Math.round(flangerMix*100)+'%'; });
   }
   if (tab==='eq'){
@@ -345,10 +367,9 @@ class Looper {
     this.stateDisplay = $('#stateDisplay'+index);
     this.recordKey = recordKey; this.stopKey = stopKey;
     this.state = 'ready';
-    this.mediaRecorder = null; this.chunks = [];
     this.loopBuffer = null; this.sourceNode = null;
     this.loopStartTime = 0; this.loopDuration = 0;
-    this.overdubChunks = []; this.holdTimer = null;
+    this.holdTimer = null;
     this.divider = 1; this.uiDisabled = false;
 
     // Track output gain
@@ -415,7 +436,7 @@ class Looper {
   }
 
   async phaseLockedRecord(){
-    if (!processedStream) await ensureMic();
+    if (!recorderNode) await ensureMic();
     if (this.index===1 || !masterIsSet){ await this.startRecording(); return; }
     this.state='waiting'; this.updateUI();
     const now = audioCtx.currentTime, master = loopers[1];
@@ -425,46 +446,63 @@ class Looper {
   }
   async _startPhaseLockedRecording(len){
     this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
+    isRecording = true;
+    audioChunks.length = 0;
+    recorderNode.port.postMessage({ type: 'start' });
     const start=Date.now(), self=this;
     (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/(len*1000); self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
     setTimeout(()=>{ if (this.state==='recording') self.stopRecordingAndPlay(); }, len*1000);
   }
   async startRecording(){
-    if (!processedStream) await ensureMic();
+    if (!recorderNode) await ensureMic();
     if (this.index>=2 && !masterIsSet) return;
     this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
+    isRecording = true;
+    audioChunks.length = 0;
+    recorderNode.port.postMessage({ type: 'start' });
     const start=Date.now(), self=this; const max=(this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
     (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/max; self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
   }
+
   async stopRecordingAndPlay(){
-    if (!this.mediaRecorder) return;
+    if (!isRecording) return;
     this.state='playing'; this.updateUI();
-    this.mediaRecorder.onstop = async ()=>{
-      const blob=new Blob(this.chunks,{type:'audio/webm'}); const buf=await blob.arrayBuffer();
-      audioCtx.decodeAudioData(buf, buffer=>{
-        this.loopBuffer=buffer; this.loopDuration=buffer.duration;
-        if (this.index===1){
-          masterLoopDuration=this.loopDuration;
-          masterBPM = Math.round((60/this.loopDuration)*4);
-          masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
-          for (let k=2;k<=4;k++) loopers[k].disable(false);
-          updateDelayFromTempo();
+    isRecording = false;
+    recorderNode.port.postMessage({ type: 'stop' });
+
+    // Combine recorded chunks into a single AudioBuffer
+    const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk[0].length, 0);
+    const audioBuffer = audioCtx.createBuffer(audioCtx.channelCount, totalLength, audioCtx.sampleRate);
+    let offset = 0;
+    for (const chunk of audioChunks) {
+        for (let i = 0; i < chunk.length; i++) {
+            audioBuffer.copyToChannel(chunk[i], i, offset);
         }
-        this.startPlayback();
-      });
-    };
-    this.mediaRecorder.stop();
+        offset += chunk[0].length;
+    }
+
+    this.loopBuffer = audioBuffer;
+    this.loopDuration = audioBuffer.duration;
+
+    if (this.index === 1) {
+        masterLoopDuration = this.loopDuration;
+        masterBPM = Math.round((60 / this.loopDuration) * 4);
+        masterIsSet = true;
+        bpmLabel.textContent = `BPM: ${masterBPM}`;
+        for (let k = 2; k <= 4; k++) loopers[k].disable(false);
+        updateDelayFromTempo();
+    }
+
+    this.startPlayback();
+    audioChunks.length = 0;
   }
+
   abortRecording(){
-    if (this.mediaRecorder && this.state==='recording'){
-      try{ this.mediaRecorder.ondataavailable=null; this.mediaRecorder.stop(); }catch{}
-      this.mediaRecorder=null; this.chunks=[]; this.state='ready'; this.loopBuffer=null; this.loopDuration=0; this.setRing(0); this.updateUI();
+    if (isRecording && this.state==='recording'){
+      isRecording = false;
+      recorderNode.port.postMessage({ type: 'stop' });
+      this.state='ready'; this.loopBuffer=null; this.loopDuration=0; this.setRing(0); this.updateUI();
+      audioChunks.length = 0;
     }
   }
 
@@ -515,7 +553,7 @@ class Looper {
       input.connect(d); d.connect(wet); wet.connect(output);
       d.connect(fb); fb.connect(d);
       d.delayTime.value = effect.params.timeSec;
-      fb.gain.value = clamp(effect.params.feedback, 0, 0.95);
+      fb.gain.value = clampFeedback(effect.params.feedback);
       wet.gain.value = clamp(effect.params.mix, 0, 1);
       effect.nodes = { input, output, dry, wet, d, fb, dispose(){ try{input.disconnect(); dry.disconnect(); wet.disconnect(); d.disconnect(); fb.disconnect(); output.disconnect();}catch{} } };
       return;
@@ -608,28 +646,66 @@ class Looper {
     setTimeout(()=>this.startOverdubRecording(), (this.loopDuration - elapsed)*1000);
   }
   startOverdubRecording(){
-    this.overdubChunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
-    this.mediaRecorder.start();
+    isRecording = true;
+    audioChunks.length = 0;
+    recorderNode.port.postMessage({ type: 'start' });
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
-  finishOverdub(){
-    if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
-      this.mediaRecorder.onstop = async ()=>{
-        const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
-        audioCtx.decodeAudioData(arr, newBuf=>{
-          const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
-          const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
-          const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
-          for (let ch=0; ch<outC; ch++){
-            const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
-            for (let i=0;i<length;i++) outD[i]=(o?o[i]||0:0)+(n?n[i]||0:0);
-          }
-          this.loopBuffer=out; this.loopDuration=out.duration; this.startPlayback();
-        });
-      };
-      this.mediaRecorder.stop();
-    } else { this.state='playing'; this.updateUI(); }
+
+  async finishOverdub(){
+    if (!isRecording) return;
+    isRecording = false;
+    recorderNode.port.postMessage({ type: 'stop' });
+
+    // Combine recorded chunks into a new AudioBuffer
+    const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk[0].length, 0);
+    const newBuffer = audioCtx.createBuffer(audioCtx.channelCount, totalLength, audioCtx.sampleRate);
+    let offset = 0;
+    for (const chunk of audioChunks) {
+        for (let i = 0; i < chunk.length; i++) {
+            newBuffer.copyToChannel(chunk[i], i, offset);
+        }
+        offset += chunk[0].length;
+    }
+    audioChunks.length = 0; // Clear chunks
+
+    // Mix the new overdub with the existing loop buffer
+    const oldBuffer = this.loopBuffer;
+    const oldLength = oldBuffer.length;
+    const newLength = newBuffer.length;
+    const maxLength = Math.max(oldLength, newLength);
+    const outputBuffer = audioCtx.createBuffer(Math.max(oldBuffer.numberOfChannels, newBuffer.numberOfChannels), maxLength, audioCtx.sampleRate);
+
+    const fadeDuration = 0.02; // 20 ms crossfade
+    const fadeSamples = Math.floor(audioCtx.sampleRate * fadeDuration);
+
+    for (let channel = 0; channel < outputBuffer.numberOfChannels; channel++) {
+        const oldData = oldBuffer.getChannelData(channel) || new Float32Array(oldLength).fill(0);
+        const newData = newBuffer.getChannelData(channel) || new Float32Array(newLength).fill(0);
+        const outputData = outputBuffer.getChannelData(channel);
+
+        for (let i = 0; i < maxLength; i++) {
+            let oldSample = oldData[i % oldLength];
+            let newSample = newData[i % newLength];
+            let mixFactor = 1.0;
+
+            // Apply crossfade to the start and end of the new overdub
+            if (i < fadeSamples) {
+                mixFactor = i / fadeSamples;
+            } else if (i > maxLength - fadeSamples) {
+                mixFactor = (maxLength - i) / fadeSamples;
+            }
+
+            // Simple summation with mix factor and normalization
+            let combinedSample = oldSample + (newSample * mixFactor);
+            // Apply a simple hard limiter to prevent clipping
+            outputData[i] = Math.max(-1.0, Math.min(1.0, combinedSample));
+        }
+    }
+
+    this.loopBuffer = outputBuffer;
+    this.loopDuration = outputBuffer.duration;
+    this.startPlayback();
   }
   clearLoop(){
     if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} }
@@ -887,7 +963,7 @@ function wireFxParams(lp, fx){
     });
     $('#dFb').addEventListener('input', e=>{
       fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`;
-      if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01);
+      if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clampFeedback(fx.params.feedback), audioCtx.currentTime, 0.01);
     });
     $('#dMix').addEventListener('input', e=>{
       fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`;
