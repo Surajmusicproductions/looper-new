@@ -57,6 +57,8 @@ let masterBus = null, masterDest = null, masterStream = null;
 
 // Option: automatically mute master/monitor while overdubbing (recommended for clean overdub)
 const AUTO_MUTE_MONITOR_ON_OVERDUB = true;
+const ALLOW_FREE_OVERDUB = false; // set to true to allow overdub to exceed loop length
+const ALLOW_WRAP_OVERDUB = false; // set to true to wrap overdub audio if shorter than loop
 
 // ======= DOM SHORTCUTS =======
 const $ = s => document.querySelector(s);
@@ -75,7 +77,12 @@ function showMsg(msg, color='#ff4444'){
   el.innerHTML = msg;
 }
 function hideMsg(){ const el = $('#startMsg'); if (el) el.style.display='none'; }
-function addTap(btn, fn){ if(!btn) return; btn.addEventListener('click', fn); btn.addEventListener('touchstart', e=>{e.preventDefault();fn(e);},{passive:false}); }
+function addTap(btn, fn){
+  if(!btn) return;
+  const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+  if (isTouch) btn.addEventListener('touchstart', e => { e.preventDefault(); fn(e); }, {passive:false});
+  else btn.addEventListener('click', fn);
+}
 function addHold(btn, onStart, onEnd){
   let hold=false;
   btn.addEventListener('mousedown', e=>{ hold=true; onStart(e); });
@@ -620,18 +627,23 @@ function wireBeforeFX(){
 }
 
 // ======= OFFLINE PITCH (worker-enabled) =======
+// Worker source for cooperative cancellation
 const _pitchWorkerSrc = (grainSize) => `
+  const cancelled = {};
   self.onmessage = function(e){
     const data = e.data;
-    if (data.cmd === 'process'){
-      const id = data.id, channels = data.channels, sr = data.sr, len = data.len,
-            semitones = data.semitones, grainSize = data.grainSize, hop = data.hop;
+    if (data.cmd === 'cancel'){ cancelled[data.id] = true; return; }
+    if (data.cmd === 'process') {
+      const { id, channels, sr, len, semitones, grainSize, hop } = data;
+      
       const ratio = Math.pow(2, semitones/12);
       const win = new Float32Array(grainSize);
       for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
       const outLen = len;
       const results = [];
+      
       for (let ch=0; ch<channels.length; ch++){
+        if (cancelled[id]) { self.postMessage({cmd:'cancelled', id}); return; }
         const inData = channels[ch];
         const outData = new Float32Array(outLen);
         for (let i=0;i<outLen;i++) outData[i]=0;
@@ -639,6 +651,7 @@ const _pitchWorkerSrc = (grainSize) => `
         let steps = Math.ceil((outLen + hop) / hop);
         let stepIdx = 0;
         for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+          if (cancelled[id]) { self.postMessage({cmd:'cancelled', id}); return; }
           const rStart = Math.floor(readPos - grainSize/2);
           for (let i=0;i<grainSize;i++){
             const inIdx = rStart + i;
@@ -657,6 +670,7 @@ const _pitchWorkerSrc = (grainSize) => `
             self.postMessage({ cmd:'progress', id, pct: Math.min(1, outPos / outLen) });
           }
         }
+        if (cancelled[id]) { self.postMessage({cmd:'cancelled', id}); return; }
         const envelope = new Float32Array(outLen);
         for (let i=0;i<outLen;i++) envelope[i]=0;
         for (let outPos = 0; outPos < outLen + hop; outPos += hop){
@@ -672,8 +686,6 @@ const _pitchWorkerSrc = (grainSize) => `
         results.push(outData.buffer);
       }
       self.postMessage({ cmd:'done', id, sr, outLen, channels: results }, results);
-    } else if (data.cmd === 'cancel') {
-      self.postMessage({ cmd:'cancelled', id: data.id });
     }
   };
 `;
@@ -855,7 +867,7 @@ async function applyPitchAfterFxToLoop(lp, semitones){
   if (Math.abs(semitones) > 8) grain = Math.min(4096, grain * 2);
   const hop = Math.max(1, Math.floor(grain * GLOBALS.PITCH_HOP_RATIO));
 
-  const jobHandle = submitPitchJobToPool(lp.loopBuffer, semitones, onProgress, undefined, grain, hop);
+  const jobHandle = submitPitchJobToPool(lp.loopBuffer, semitones, pct => { showOfflineProgress(lp.index, pct); }, undefined, grain, hop);
   lp._pitchJob = jobHandle;
   try {
     const newBuf = await jobHandle.promise;
@@ -918,6 +930,7 @@ class Looper {
     this._pitchJob = null;
     this._lastUnprocessedBuffer = null;
     this._undoStack = [];
+    this.isLoopbackDetected = false;
 
     this.gainNode = audioCtx.createGain();
     const volSlider = $('#volSlider'+index), volValue = $('#volValue'+index);
@@ -1206,6 +1219,15 @@ class Looper {
       setTimeout(hideMsg, 1000);
       return;
     }
+    
+    // Loopback detection before arming overdub
+    if (this.isLoopbackDetected){
+      showMsg(`⚠️ Loopback detected on your device. Disable monitor/loopback in your audio interface settings to prevent re-recording playback.`, '#ffcc00');
+      // Option to force overdub
+      const forceOverdub = confirm('Loopback detected. Continue overdub anyway?');
+      if (!forceOverdub) return;
+    }
+
     this.state='overdub'; this.updateUI();
     const now = audioCtx.currentTime;
     const elapsed = isFinite(now - this.loopStartTime) ? (now - this.loopStartTime) % this.loopDuration : 0;
@@ -1253,22 +1275,34 @@ class Looper {
     this.mediaRecorder.onstop = async ()=>{
       try {
         const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
-        const newBuf = await decodeAudioBuffer(arr);
+        let newBuf = await decodeAudioBuffer(arr);
+        
+        // Resample new buffer if sample rates don't match
+        if (newBuf.sampleRate !== this.loopBuffer.sampleRate) {
+          newBuf = await resampleAudioBuffer(newBuf, this.loopBuffer.sampleRate);
+        }
+
         if (!this.loopBuffer){
           this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreAfterOverdub(this); this.startPlayback(); return;
         }
+
         const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
         const outC=Math.max(oC,nC);
-        // Strict length overdub: pad or trim new buffer to match original loop length
+        
         const baseLen = this.loopBuffer.length;
         const overdubBuffer = audioCtx.createBuffer(nC, baseLen, newBuf.sampleRate);
         for(let ch=0; ch < nC; ch++){
           const odData = overdubBuffer.getChannelData(ch);
           const newBufData = newBuf.getChannelData(ch);
           for(let i=0; i < baseLen; i++){
-            odData[i] = newBufData[i % newBuf.length] || 0; // Wrap or pad with zeros
+            if (ALLOW_WRAP_OVERDUB) {
+              odData[i] = newBufData[i % newBuf.length] || 0;
+            } else {
+              odData[i] = (i < newBufData.length) ? newBufData[i] : 0;
+            }
           }
         }
+        
         const out=audioCtx.createBuffer(outC, baseLen, this.loopBuffer.sampleRate);
         for (let ch=0; ch<outC; ch++){
           const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?overdubBuffer.getChannelData(ch):null;
@@ -1278,6 +1312,7 @@ class Looper {
             outD[i] = ov + nv;
           }
         }
+
         this.loopBuffer = out; this.loopDuration = out.duration;
         restoreAfterOverdub(this);
         this.startPlayback();
@@ -1306,6 +1341,18 @@ class Looper {
     } else { this.setRing(0); }
   }
 }
+
+// Resample buffer to target sample rate
+async function resampleAudioBuffer(buf, targetSampleRate){
+  if (buf.sampleRate === targetSampleRate) return buf;
+  const offline = new OfflineAudioContext(buf.numberOfChannels, Math.ceil(buf.duration * targetSampleRate), targetSampleRate);
+  const src = offline.createBufferSource();
+  src.buffer = buf;
+  src.connect(offline.destination);
+  src.start(0);
+  return offline.startRendering();
+}
+
 window.addEventListener('beforeunload', () => {
   try {
     for (const p of _pitchWorkerPool) try { p.worker.terminate(); } catch(e){}
