@@ -122,13 +122,20 @@ function getRecordingStream(){
 
 // Global recorder lock & safe factory
 let _globalRecordingLock = false;
+let _globalRecordingLockTimestamp = 0;
 function tryClaimRecLock(){
-  if (_globalRecordingLock) return false;
+  if (_globalRecordingLock) {
+    if (Date.now() - _globalRecordingLockTimestamp > GLOBALS.RECORDER_GLOBAL_TIMEOUT_MS + 3000) {
+      _globalRecordingLock = false;
+    } else return false;
+  }
   _globalRecordingLock = true;
+  _globalRecordingLockTimestamp = Date.now();
   return true;
 }
 function releaseRecLock(){
   _globalRecordingLock = false;
+  _globalRecordingLockTimestamp = 0;
 }
 function pickAudioMime(){
   if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
@@ -1251,11 +1258,21 @@ class Looper {
           this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreAfterOverdub(this); this.startPlayback(); return;
         }
         const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
-        const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
-        const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
+        const outC=Math.max(oC,nC);
+        // Strict length overdub: pad or trim new buffer to match original loop length
+        const baseLen = this.loopBuffer.length;
+        const overdubBuffer = audioCtx.createBuffer(nC, baseLen, newBuf.sampleRate);
+        for(let ch=0; ch < nC; ch++){
+          const odData = overdubBuffer.getChannelData(ch);
+          const newBufData = newBuf.getChannelData(ch);
+          for(let i=0; i < baseLen; i++){
+            odData[i] = newBufData[i % newBuf.length] || 0; // Wrap or pad with zeros
+          }
+        }
+        const out=audioCtx.createBuffer(outC, baseLen, this.loopBuffer.sampleRate);
         for (let ch=0; ch<outC; ch++){
-          const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
-          for (let i=0;i<length;i++){
+          const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?overdubBuffer.getChannelData(ch):null;
+          for (let i=0;i<baseLen;i++){
             const ov = o ? (o[i] || 0) : 0;
             const nv = n ? (n[i] || 0) : 0;
             outD[i] = ov + nv;
