@@ -95,10 +95,11 @@ function quarterSecForBPM(bpm){ return 60/(bpm||120); }
 function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ? mult*(2/3) : mult; }
 
 // ======= RECORDING STREAM HELPERS =======
-// IMPORTANT: prefer micStream (raw gUM) to avoid recording the output mix back into overdubs
+// IMPORTANT: return ONLY the raw mic stream for recording.
+// If micStream is not available, return null (no fallback to processedStream).
 function getRecordingStream(){
   if (micStream && micStream.active) return micStream;
-  return processedStream || micStream;
+  return null;
 }
 
 // ======= AUDIO SETUP =======
@@ -585,13 +586,20 @@ class Looper {
   async _startPhaseLockedRecording(len){
     this.state='recording'; this.updateUI();
     this.chunks=[];
+    // Use ONLY raw mic stream for recording — do not fall back to the processed mix.
+    const recStream = getRecordingStream();
+    if (!recStream) {
+      showMsg('❌ Microphone not available for recording (start mic first)', '#ff6b6b');
+      this.state = 'ready'; this.updateUI();
+      return;
+    }
     try {
-      // Use raw micStream to avoid routing playback into the recorded input
-      const recStream = getRecordingStream();
-      this.mediaRecorder=new MediaRecorder(recStream);
-    } catch(e){
-      // fallback
-      this.mediaRecorder=new MediaRecorder(processedStream);
+      this.mediaRecorder = new MediaRecorder(recStream);
+    } catch (e) {
+      console.error('MediaRecorder start failed', e);
+      showMsg('❌ Cannot start recorder', '#ff6b6b');
+      this.state = 'ready'; this.updateUI();
+      return;
     }
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
     this.mediaRecorder.start();
@@ -605,11 +613,20 @@ class Looper {
     if (this.index>=2 && !masterIsSet) return;
     this.state='recording'; this.updateUI();
     this.chunks=[];
+    // Only allow raw mic recording for loops
+    const recStream = getRecordingStream();
+    if (!recStream) {
+      showMsg('❌ Microphone not available for recording (start mic first)', '#ff6b6b');
+      this.state = 'ready'; this.updateUI();
+      return;
+    }
     try {
-      const recStream = getRecordingStream();
-      this.mediaRecorder=new MediaRecorder(recStream);
-    } catch(e){
-      this.mediaRecorder=new MediaRecorder(processedStream);
+      this.mediaRecorder = new MediaRecorder(recStream);
+    } catch (e) {
+      console.error('MediaRecorder start failed', e);
+      showMsg('❌ Cannot start recorder', '#ff6b6b');
+      this.state = 'ready'; this.updateUI();
+      return;
     }
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
     this.mediaRecorder.start();
@@ -743,14 +760,36 @@ class Looper {
       if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime(0, audioCtx.currentTime);
     }
 
-    this.overdubChunks=[];
-    try {
-      const recStream = getRecordingStream();
-      this.mediaRecorder=new MediaRecorder(recStream);
-    } catch(e){
-      this.mediaRecorder=new MediaRecorder(processedStream);
+    this.overdubChunks = [];
+
+    // Must record only the mic — no fallback to processedStream allowed
+    const recStream = getRecordingStream();
+    if (!recStream) {
+      // restore monitor/master if we muted it earlier
+      if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+        if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
+        if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
+      }
+      showMsg('❌ Microphone not available for overdub', '#ff6b6b');
+      this.state = 'playing'; this.updateUI();
+      return;
     }
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
+
+    try {
+      this.mediaRecorder = new MediaRecorder(recStream);
+    } catch (e) {
+      console.error('MediaRecorder start failed', e);
+      // restore monitor/master
+      if (AUTO_MUTE_MONITOR_ON_OVERDUB){
+        if (masterBus) masterBus.gain.setValueAtTime((this._prevMasterGain!==undefined?this._prevMasterGain:1), audioCtx.currentTime);
+        if (liveMicMonitorGain) liveMicMonitorGain.gain.setValueAtTime((this._prevLiveMonGain!==undefined?this._prevLiveMonGain:0), audioCtx.currentTime);
+      }
+      showMsg('❌ Cannot start overdub recorder', '#ff6b6b');
+      this.state = 'playing'; this.updateUI();
+      return;
+    }
+
+    this.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
@@ -1139,4 +1178,6 @@ if (mixBtn){
     if (!mixRecording) startMasterRecording();
     else stopMasterRecording();
   });
+}
+
 }
