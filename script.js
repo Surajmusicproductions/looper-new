@@ -73,7 +73,7 @@ function addHold(btn, onStart, onEnd){
   ['touchend','touchcancel'].forEach(ev=>btn.addEventListener(ev, e=>{ if(hold) onEnd(e); hold=false; }, {passive:false}));
 }
 function clamp(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
-function debounce(fn, ms=130){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+function debounce(fn, ms=130){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
 
 // Reverb IR (simple algorithmic room)
 function makeReverbImpulse(seconds, decay){
@@ -95,16 +95,25 @@ function quarterSecForBPM(bpm){ return 60/(bpm||120); }
 function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ? mult*(2/3) : mult; }
 
 // ======= RECORDING STREAM HELPERS =======
-// IMPORTANT: return ONLY the raw mic stream for recording.
-// If micStream is not available, return null (no fallback to processedStream).
+function isMicStreamAlive(ms){
+  if (!ms) return false;
+  if (typeof ms.active === 'boolean' && !ms.active) return false;
+  const tracks = ms.getAudioTracks ? ms.getAudioTracks() : [];
+  if (!tracks.length) return false;
+  // track must be enabled and live
+  return tracks.some(t => t.enabled && t.readyState === 'live');
+}
+
 function getRecordingStream(){
-  if (micStream && micStream.active) return micStream;
+  if (isMicStreamAlive(micStream)) return micStream;
   return null;
 }
 
 // ======= AUDIO SETUP =======
 async function ensureMic(){
-  if (micStream) return;
+  // If micStream and micSource already initialized, nothing to do.
+  if (micStream && micSource) return;
+
   if (audioCtx.state === 'suspended') {
     try { await audioCtx.resume(); } catch {}
   }
@@ -114,6 +123,16 @@ async function ensureMic(){
   } catch(e){ showMsg('❌ Microphone access denied'); throw e; }
 
   micSource = audioCtx.createMediaStreamSource(micStream);
+  
+  // If the mic stream ends (user revoked / unplugged), cleanup
+  micStream.getAudioTracks().forEach(t => {
+    t.addEventListener('ended', () => {
+      showMsg('⚠️ Microphone disconnected', '#ffb4a2');
+      // tear down nodes so ensureMic will re-init if needed
+      try{ micSource.disconnect(); }catch{}; micSource = null;
+      micStream = null;
+    });
+  });
 
   dryGain = audioCtx.createGain();   dryGain.gain.value = 1;
   fxSumGain = audioCtx.createGain(); fxSumGain.gain.value = 1;
@@ -368,39 +387,144 @@ function wireBeforeFX(){
   }
 }
 
-// ======= AFTER-FX PITCH (offline) UTILITIES =======
-// Granular pitch shifting (time-domain) for offline AudioBuffer -> AudioBuffer
-// This preserves duration while changing pitch by semitones. Not perfect formant preservation
-// but much better than raw playbackRate (which changes duration).
+// ======= OFFLINE PITCH (worker-enabled) =======
+
+let __pitchWorker = null;
+function createPitchWorker(){
+  if (__pitchWorker) return __pitchWorker;
+  try {
+    const workerSrc = `
+      self.onmessage = function(e){
+        const { id, channels, sr, len, semitones, grainSize, hop } = e.data;
+        const ratio = Math.pow(2, semitones/12);
+        const win = new Float32Array(grainSize);
+        for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
+        const outLen = len;
+        const results = [];
+        for (let ch=0; ch<channels.length; ch++){
+          const inData = channels[ch];
+          const outData = new Float32Array(outLen);
+          for (let i=0;i<outLen;i++) outData[i]=0;
+          let readPos = 0;
+          for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+            const rStart = Math.floor(readPos - grainSize/2);
+            for (let i=0;i<grainSize;i++){
+              const inIdx = rStart + i;
+              let s = 0;
+              if (inIdx >= 0 && inIdx < inData.length) s = inData[inIdx];
+              const w = win[i];
+              const target = outPos + i - Math.floor(grainSize/2);
+              if (target >= 0 && target < outLen){
+                outData[target] += s * w;
+              }
+            }
+            readPos += ratio * hop;
+            if (readPos > inData.length + grainSize) readPos = readPos % inData.length;
+          }
+          // envelope normalization
+          const envelope = new Float32Array(outLen);
+          for (let i=0;i<outLen;i++) envelope[i]=0;
+          for (let outPos = 0; outPos < outLen + hop; outPos += hop){
+            for (let i=0;i<grainSize;i++){
+              const target = outPos + i - Math.floor(grainSize/2);
+              if (target >= 0 && target < outLen) envelope[target] += win[i];
+            }
+          }
+          for (let i=0;i<outLen;i++){
+            const env = envelope[i] || 1e-8;
+            outData[i] = outData[i] / env;
+          }
+          results.push(outData.buffer);
+        }
+        // Transfer buffers back
+        self.postMessage({ id, sr, outLen, channels: results }, results);
+      };
+    `;
+    const blob = new Blob([workerSrc], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    __pitchWorker = new Worker(url);
+    URL.revokeObjectURL(url);
+    return __pitchWorker;
+  } catch (e){
+    console.warn('Pitch worker creation failed, falling back to main thread:', e);
+    __pitchWorker = null;
+    return null;
+  }
+}
+
+// worker-backed pitch shift. Falls back to inline processing if worker unavailable.
 async function pitchShiftBufferOffline(inputBuffer, semitones){
   if (!inputBuffer) return inputBuffer;
-  const ratio = Math.pow(2, semitones/12); // desired pitch ratio
   const sr = inputBuffer.sampleRate;
   const channels = inputBuffer.numberOfChannels;
   const len = inputBuffer.length;
-  const outLen = len; // we preserve duration (same number of samples)
-  const grainSize = 2048; // grain window size (power of two)
-  const hop = Math.floor(grainSize * 0.25); // 75% overlap
+  const grainSize = 2048;
+  const hop = Math.floor(grainSize * 0.25);
+
+  // Try worker
+  const worker = createPitchWorker();
+  if (worker){
+    return new Promise((resolve, reject) => {
+      const id = Math.random().toString(36).slice(2);
+      const channelArrays = [];
+      for (let ch=0; ch<channels; ch++) channelArrays.push(inputBuffer.getChannelData(ch).slice(0)); // copy
+      const onmsg = function(ev){
+        const d = ev.data || {};
+        const ok = (!d.id) || (d.id === id);
+        if (!ok) return;
+        try {
+          const { channels: chBuffers, outLen, sr: outSR } = d;
+          const outBuf = audioCtx.createBuffer(chBuffers.length, outLen, outSR);
+          for (let c=0; c<chBuffers.length; c++){
+            const fa = new Float32Array(chBuffers[c]);
+            outBuf.copyToChannel(fa, c, 0);
+          }
+          worker.removeEventListener('message', onmsg);
+          resolve(outBuf);
+        } catch (err){
+          worker.removeEventListener('message', onmsg);
+          reject(err);
+        }
+      };
+      worker.addEventListener('message', onmsg);
+      try {
+        const transfer = channelArrays.map(a=>a.buffer);
+        worker.postMessage({ id, channels: channelArrays, sr, len, semitones, grainSize, hop }, transfer);
+      } catch (err){
+        worker.removeEventListener('message', onmsg);
+        reject(err);
+      }
+    }).catch(async (e) => {
+      console.warn('Worker processing failed, falling back to main thread:', e);
+      return inlinePitchShift(inputBuffer, semitones, grainSize, hop);
+    });
+  } else {
+    // fallback
+    return inlinePitchShift(inputBuffer, semitones, grainSize, hop);
+  }
+}
+
+// Inline fallback (your original algorithm extracted to a helper)
+async function inlinePitchShift(inputBuffer, semitones, grainSize=2048, hop=Math.floor(2048*0.25)){
+  if (!inputBuffer) return inputBuffer;
+  const ratio = Math.pow(2, semitones/12);
+  const sr = inputBuffer.sampleRate;
+  const channels = inputBuffer.numberOfChannels;
+  const len = inputBuffer.length;
+  const outLen = len;
   const output = audioCtx.createBuffer(channels, outLen, sr);
 
   // Hann window
   const win = new Float32Array(grainSize);
   for (let i=0;i<grainSize;i++) win[i] = 0.5*(1 - Math.cos(2*Math.PI*i/(grainSize-1)));
 
-  // For each channel process
   for (let ch=0; ch<channels; ch++){
     const inData = inputBuffer.getChannelData(ch);
     const outData = output.getChannelData(ch);
-    // zero output
     for (let i=0;i<outLen;i++) outData[i] = 0;
-
-    // read pointer moves at rate = ratio (if ratio>1 pitch up: read faster)
     let readPos = 0;
-    // We'll place grains into out buffer at fixed hop, but read window from input at grainSize centered around readPos
     for (let outPos = 0; outPos < outLen + hop; outPos += hop){
-      // read window start
       const rStart = Math.floor(readPos - grainSize/2);
-      // window samples
       for (let i=0;i<grainSize;i++){
         const inIdx = rStart + i;
         let s = 0;
@@ -412,53 +536,52 @@ async function pitchShiftBufferOffline(inputBuffer, semitones){
         }
       }
       readPos += ratio * hop;
-      // clamp to input bounds
       if (readPos > len + grainSize) readPos = readPos % len;
     }
-
-    // Normalize by approximate window sum to avoid level changes
-    // compute window normalization factor (sum of windows overlapping)
-    // We'll compute a simple overlap-add normalization by running through outData and dividing where >0
-    // Compute local envelope (smoothed)
     const envelope = new Float32Array(outLen);
-    for (let i=0;i<outLen;i++) envelope[i] = 0;
-    // Re-run a window to build envelope
-    let tmpRead = 0;
+    for (let i=0;i<outLen;i++) envelope[i]=0;
     for (let outPos = 0; outPos < outLen + hop; outPos += hop){
       for (let i=0;i<grainSize;i++){
         const target = outPos + i - Math.floor(grainSize/2);
         if (target >= 0 && target < outLen) envelope[target] += win[i];
       }
-      tmpRead += ratio * hop;
     }
-    // Normalize
     for (let i=0;i<outLen;i++){
       const env = envelope[i] || 1e-8;
       outData[i] = outData[i] / env;
     }
   }
-
   return output;
 }
 
-// Apply Pitch After-FX to a Looper's loopBuffer (asynchronous)
+// Apply Pitch After-FX to a Looper's loopBuffer (unchanged API, now worker-backed)
 async function applyPitchAfterFxToLoop(lp, semitones){
   if (!lp.loopBuffer) return;
+  lp.cancelPitchJob?.();
   showMsg(`⏳ Applying pitch ${semitones} st to Track ${lp.index}...`, '#ffd166');
+  const job = { cancelled:false, cancel(){ this.cancelled=true; terminatePitchWorker(); } };
+  lp._pitchJob = job;
   try {
     const newBuf = await pitchShiftBufferOffline(lp.loopBuffer, semitones);
+    if (job.cancelled) { showMsg('⚠️ Pitch cancelled', '#ffe066'); setTimeout(hideMsg,1000); return; }
+    lp._lastUnprocessedBuffer = lp.loopBuffer;
     lp.loopBuffer = newBuf;
     lp.loopDuration = newBuf.duration;
-    // restart playback if playing
     if (lp.state === 'playing' || lp.state === 'overdub') lp.startPlayback();
     renderTrackFxSummary(lp.index);
     showMsg(`✅ Pitch applied (${semitones} st) to Track ${lp.index}`, '#a7ffed');
     setTimeout(hideMsg, 900);
   } catch (e){
+    if (job.cancelled) return;
     console.error('Pitch processing failed', e);
     showMsg('❌ Pitch processing failed', '#ff6b6b');
     setTimeout(hideMsg, 1300);
+  } finally {
+    lp._pitchJob = null;
   }
+}
+function terminatePitchWorker(){
+  if (__pitchWorker){ try{ __pitchWorker.terminate(); }catch{} __pitchWorker = null; }
 }
 
 // ======= LOOPER (core) =======
@@ -478,6 +601,8 @@ class Looper {
     this.loopStartTime = 0; this.loopDuration = 0;
     this.overdubChunks = [];
     this.divider = 1; this.uiDisabled = false;
+    this._pitchJob = null;
+    this._lastUnprocessedBuffer = null;
 
     // Track output gain
     this.gainNode = audioCtx.createGain();
@@ -521,9 +646,8 @@ class Looper {
 
     const fxBtn = $('#fxMenuBtn' + index);
     if (fxBtn) fxBtn.addEventListener('click', () => openTrackFxMenu(this.index));
-  } // <<< --- CORRECTED: Constructor ends here
+  }
 
-  // <<< --- CORRECTED: All methods are now outside the constructor
   setLED(color){
     const map={green:'#22c55e', red:'#e11d48', orange:'#f59e0b', gray:'#6b7280'};
     this.ledRing.style.stroke=map[color]||'#fff';
@@ -639,7 +763,8 @@ class Looper {
     this.state='playing'; this.updateUI();
     this.mediaRecorder.onstop = async ()=>{
       const blob=new Blob(this.chunks,{type:'audio/webm'}); const buf=await blob.arrayBuffer();
-      audioCtx.decodeAudioData(buf, buffer=>{
+      try {
+        const buffer = await decodeAudioBuffer(buf);
         this.loopBuffer=buffer; this.loopDuration=buffer.duration;
         if (this.index===1){
           masterLoopDuration=this.loopDuration;
@@ -649,7 +774,11 @@ class Looper {
           for (let k=2;k<=4;k++) loopers[k].disable(false);
         }
         this.startPlayback();
-      });
+      } catch (e) {
+        console.error('decodeAudioData failed', e);
+        showMsg('❌ Cannot decode recorded audio', '#ff6b6b');
+        this.state = 'ready'; this.updateUI();
+      }
     };
     this.mediaRecorder.stop();
   }
@@ -715,6 +844,10 @@ class Looper {
     }
     try{ head.connect(this.gainNode); }catch{}
     // Connect to masterBus (master mix)
+    if (!masterBus){
+      console.warn('masterBus missing; creating on demand');
+      ensureMasterBus();
+    }
     this.gainNode.connect(masterBus);
   }
 
@@ -730,7 +863,7 @@ class Looper {
     }
     this.loopStartTime = audioCtx.currentTime - off;
     this._rebuildChainWiring();
-    try{ this.sourceNode.start(0, off); }catch{ try{ this.sourceNode.start(0,0); }catch{} }
+    try{ this.sourceNode.start(audioCtx.currentTime, off); } catch { try{ this.sourceNode.start(audioCtx.currentTime, 0); } catch {} }
     this.state='playing'; this.updateUI(); this._animate();
     renderTrackFxSummary(this.index);
   }
@@ -746,9 +879,22 @@ class Looper {
 
   armOverdub(){
     if (this.state!=='playing') return;
+    if (!this.loopDuration || this.loopDuration <= 0){
+      // can't overdub without a valid loop duration
+      showMsg('❌ Loop duration invalid — cannot overdub', '#ff6b6b');
+      setTimeout(hideMsg, 1000);
+      return;
+    }
+
     this.state='overdub'; this.updateUI();
-    const now=audioCtx.currentTime; const elapsed=(now-this.loopStartTime)%this.loopDuration;
-    setTimeout(()=>this.startOverdubRecording(), (this.loopDuration - elapsed)*1000);
+
+    const now = audioCtx.currentTime;
+    // protect against NaN from loopStartTime
+    const elapsed = isFinite(now - this.loopStartTime) ? (now - this.loopStartTime) % this.loopDuration : 0;
+    // ensure toNext is in [0, loopDuration)
+    let toNext = this.loopDuration - elapsed;
+    if (!isFinite(toNext) || toNext < 0) toNext = 0;
+    setTimeout(()=>this.startOverdubRecording(), toNext * 1000);
   }
 
   startOverdubRecording(){
@@ -774,9 +920,9 @@ class Looper {
       this.state = 'playing'; this.updateUI();
       return;
     }
-
+    const recMime = pickAudioMime();
     try {
-      this.mediaRecorder = new MediaRecorder(recStream);
+      this.mediaRecorder = recMime ? new MediaRecorder(recStream, { mimeType: recMime }) : new MediaRecorder(recStream);
     } catch (e) {
       console.error('MediaRecorder start failed', e);
       // restore monitor/master
@@ -791,7 +937,9 @@ class Looper {
 
     this.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
-    setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
+    // guard timeout: ensure a minimal positive timeout if loopDuration missing
+    const d = (this.loopDuration && this.loopDuration > 0) ? this.loopDuration : 0.001;
+    setTimeout(()=>this.finishOverdub(), d * 1000);
   }
 
   finishOverdub(){
@@ -807,7 +955,7 @@ class Looper {
       this.mediaRecorder.onstop = async ()=>{
         try {
           const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
-          const newBuf = await audioCtx.decodeAudioData(arr);
+          const newBuf = await decodeAudioBuffer(arr);
           if (!this.loopBuffer){
             // if no previous loop (shouldn't happen for overdub) just assign
             this.loopBuffer = newBuf; this.loopDuration = newBuf.duration; restoreMonitor(); this.startPlayback(); return;
@@ -856,7 +1004,11 @@ class Looper {
       this.setRing(pos/this.loopDuration); requestAnimationFrame(this._animate.bind(this));
     } else { this.setRing(0); }
   }
-} // <<< --- Looper class ends here
+}
+
+window.addEventListener('beforeunload', () => {
+  try { __pitchWorker?.terminate(); } catch (e) {}
+});
 
 // ======= BUILD LOOPERS + KEYBINDS =======
 const keyMap = [{rec:'w',stop:'s'},{rec:'e',stop:'d'},{rec:'r',stop:'f'},{rec:'t',stop:'g'}];
@@ -1057,9 +1209,10 @@ async function startMasterRecording(){
   if (!masterStream){
     showMsg('❌ Master stream not available'); return;
   }
+  const recMime = pickAudioMime();
   try {
     mixChunks = [];
-    mixRecorder = new MediaRecorder(masterStream);
+    mixRecorder = recMime ? new MediaRecorder(masterStream, { mimeType: recMime }) : new MediaRecorder(masterStream);
     mixRecorder.ondataavailable = (e)=>{ if (e.data?.size) mixChunks.push(e.data); };
     mixRecorder.onstop = async ()=>{ await saveMasterRecording(); };
     mixRecorder.start();
@@ -1080,6 +1233,14 @@ async function stopMasterRecording(){
 
 async function blobToArrayBuffer(blob){
   return await new Response(blob).arrayBuffer();
+}
+
+// Helper to pick a compatible audio mimetype
+function pickAudioMime(){
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
+  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+  if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) return 'audio/ogg;codecs=opus';
+  return '';
 }
 
 async function encodeMp3FromWebm(webmBlob){
@@ -1103,7 +1264,7 @@ async function encodeMp3FromWebm(webmBlob){
 
   // Decode webm -> PCM via WebAudio, then encode MP3
   const arr = await blobToArrayBuffer(webmBlob);
-  const audioBuf = await audioCtx.decodeAudioData(arr);
+  const audioBuf = await decodeAudioBuffer(arr);
 
   const numCh = audioBuf.numberOfChannels;
   const sr = audioBuf.sampleRate;
@@ -1169,4 +1330,16 @@ async function saveMasterRecording(){
   URL.revokeObjectURL(a.href);
   showMsg('✅ Saved WebM to downloads', '#a7ffed');
   setTimeout(hideMsg, 1500);
-  }
+}
+
+// Global helper to handle both Promise and callback decodeAudioData
+function decodeAudioBuffer(arrayBuffer){
+  return new Promise((resolve, reject) => {
+    try {
+      const p = audioCtx.decodeAudioData(arrayBuffer, resolve, reject);
+      if (p && typeof p.then === 'function') p.then(resolve).catch(reject);
+    } catch (err) {
+      audioCtx.decodeAudioData(arrayBuffer, resolve, reject);
+    }
+  });
+}
