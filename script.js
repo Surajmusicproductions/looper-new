@@ -492,26 +492,37 @@ class Looper {
         const buffer = audioCtx.createBuffer(channels.length, length, sampleRate);
         channels.forEach((data, ch)=> buffer.getChannelData(ch).set(data));
 
-        // FIX #3: Trim/Pad loop buffers to prevent drift
+        // ======================= FIX #2 APPLIED HERE =======================
         const sr = sampleRate;
         let targetSamples;
+
         if (this.index === 1) {
-          targetSamples = Math.round(this.targetLenSec * sr);
+          // Use the actual recorded frames if recording stopped early.
+          // If the recording did actually run full-length (rare), we can cap to targetLenSec*sr.
+          const cap = Math.round(this.targetLenSec * sr);
+          // prefer buffer.length (actual recorded frames); but if recorded frames > cap, clamp to cap
+          targetSamples = Math.min(buffer.length, cap);
         } else {
+          // For non-master tracks we want exact aligned length based on masterLoopDuration
           targetSamples = Math.round(masterLoopDuration * sr * this.divider);
         }
 
-        if (buffer.length !== targetSamples) {
+        // Create final buffer using targetSamples (no zero-padding if buffer was shorter)
+        if (buffer.length === targetSamples) {
+          this.loopBuffer = buffer;
+          this.loopDuration = buffer.duration;
+        } else {
+          // Copy only the available frames up to targetSamples (if available) - will trim if needed
           const out = audioCtx.createBuffer(buffer.numberOfChannels, targetSamples, sr);
           for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-            out.getChannelData(ch).set(buffer.getChannelData(ch).subarray(0, targetSamples));
+            const src = buffer.getChannelData(ch);
+            // copy only available frames (src may be shorter than targetSamples)
+            out.getChannelData(ch).set(src.subarray(0, Math.min(src.length, targetSamples)));
           }
           this.loopBuffer = out;
           this.loopDuration = out.duration;
-        } else {
-          this.loopBuffer = buffer;
-          this.loopDuration = buffer.duration;
         }
+        // ======================= END OF FIX #2 =======================
 
         if (this.index===1){
           masterLoopDuration=this.loopDuration;
@@ -598,7 +609,13 @@ async _startPhaseLockedRecording(len){
 
 async startRecording(){
   if (this.index>=2 && !masterIsSet) return;
-  const max = (this.index===1) ? 60 : (masterLoopDuration? masterLoopDuration*this.divider : 12);
+
+  // ======================= FIX #1 APPLIED HERE =======================
+  // For master (index===1) use a large safety cap (seconds) so user can stop early.
+  // We do NOT want to force the final loop length to this cap if user stops early.
+  const max = (this.index===1) ? 600 : (masterLoopDuration ? masterLoopDuration * this.divider : 12);
+  // ======================= END OF FIX #1 =======================
+
   this._startWorkletRecording(max);
 }
 
@@ -921,7 +938,7 @@ function renderFxParamsBody(fx){
 function wireFxParams(lp, fx){
   if (fx.type==='Pitch'){ $('#pSem').addEventListener('input', e=>{ fx.params.semitones = parseInt(e.target.value,10); $('#pSemVal').textContent = fx.params.semitones; lp.pitchSemitones = fx.params.semitones; if (lp.state==='playing') lp._applyPitchIfAny(); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='LowPass'){ $('#lpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#lpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#lpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
-  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
+  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#hpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Pan'){ $('#pan').addEventListener('input', e=>{ fx.params.pan = parseFloat(e.target.value); $('#panVal').textContent = fx.params.pan.toFixed(2); if (fx.nodes?.panner) fx.nodes.panner.pan.setTargetAtTime(fx.params.pan, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='Delay'){ $('#dTime').addEventListener('input', e=>{ fx.params.timeSec = parseInt(e.target.value,10)/1000; $('#dTimeVal').textContent = `${parseInt(e.target.value,10)} ms`; if (fx.nodes?.d) fx.nodes.d.delayTime.setTargetAtTime(fx.params.timeSec, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#dFb').addEventListener('input', e=>{ fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01); }); $('#dMix').addEventListener('input', e=>{ fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.wet) fx.nodes.wet.gain.setTargetAtTime(clamp(fx.params.mix,0,1), audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Compressor'){ $('#cTh').addEventListener('input', e=>{ fx.params.threshold = parseInt(e.target.value,10); $('#cThVal').textContent = fx.params.threshold+' dB'; if (fx.nodes?.comp) fx.nodes.comp.threshold.setTargetAtTime(fx.params.threshold, audioCtx.currentTime, 0.01); }); $('#cRa').addEventListener('input', e=>{ fx.params.ratio = parseFloat(e.target.value); $('#cRaVal').textContent = fx.params.ratio+':1'; if (fx.nodes?.comp) fx.nodes.comp.ratio.setTargetAtTime(fx.params.ratio, audioCtx.currentTime, 0.01); }); $('#cKn').addEventListener('input', e=>{ fx.params.knee = parseInt(e.target.value,10); $('#cKnVal').textContent = fx.params.knee+' dB'; if (fx.nodes?.comp) fx.nodes.comp.knee.setTargetAtTime(fx.params.knee, audioCtx.currentTime, 0.01); }); $('#cAt').addEventListener('input', e=>{ fx.params.attack = parseFloat(e.target.value)/1000; $('#cAtVal').textContent = (fx.params.attack*1000).toFixed(1)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.attack.setTargetAtTime(fx.params.attack, audioCtx.currentTime, 0.01); }); $('#cRl').addEventListener('input', e=>{ fx.params.release = parseFloat(e.target.value)/1000; $('#cRlVal').textContent = (fx.params.release*1000).toFixed(0)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.release.setTargetAtTime(fx.params.release, audioCtx.currentTime, 0.01); }); }
@@ -1066,7 +1083,7 @@ async function saveMasterRecording(){
     const mp3 = await encodeMp3FromWebm(webmBlob);
     if (mp3){
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(mp3);
+      a.href = URL.ObjectURL(mp3);
       a.download = `looper-mix-${Date.now()}.mp3`;
       a.click();
       URL.revokeObjectURL(a.href);
