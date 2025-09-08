@@ -614,9 +614,13 @@ class Looper {
   }
 
   startOverdubRecording(){
+    this.overdubStartTime = audioCtx.currentTime;
     this.overdubChunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
+
+    this._overdubAnimate(); // start overdub ring animation
+
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
 
@@ -633,6 +637,7 @@ class Looper {
             for (let i=0;i<length;i++) outD[i]=(o?o[i]||0:0)+(n?n[i]||0:0);
           }
           this.loopBuffer=out; this.loopDuration=out.duration; this.startPlayback();
+          this._animate(); // return to playback ring animation
         });
       };
       this.mediaRecorder.stop();
@@ -655,6 +660,14 @@ class Looper {
       const now = audioCtx.currentTime; const pos=(now - this.loopStartTime)%this.loopDuration;
       this.setRing(pos/this.loopDuration); requestAnimationFrame(this._animate.bind(this));
     } else { this.setRing(0); }
+  }
+  _overdubAnimate(){
+    if (this.state==='overdub' && this.loopDuration>0){
+      const now = audioCtx.currentTime;
+      const pos = (now - this.overdubStartTime) % this.loopDuration;
+      this.setRing(pos / this.loopDuration);
+      requestAnimationFrame(this._overdubAnimate.bind(this));
+    }
   }
 } // <<< --- CORRECTED: Looper class ends here
 
