@@ -138,7 +138,8 @@ async function ensureMic(){
 
   // Recording
   mixDest = audioCtx.createMediaStreamDestination();
-  dryGain.connect(mixDest); fxSumGain.connect(mixDest);
+  dryGain.connect(mixDest);
+  fxSumGain.connect(mixDest);
   processedStream = mixDest.stream;
 
   // ADDITION: MASTER BUS (final mix for export)
@@ -153,40 +154,36 @@ async function ensureMic(){
   masterBus.connect(masterDest);
   masterStream = masterDest.stream;
 
-  // Live monitor
-  liveMicMonitorGain = audioCtx.createGain(); liveMicMonitorGain.gain.value = 0;
-  dryGain.connect(liveMicMonitorGain); fxSumGain.connect(liveMicMonitorGain); liveMicMonitorGain.connect(audioCtx.destination);
+  // Live monitor (start MUTED to avoid headphone echo)
+  liveMicMonitorGain = audioCtx.createGain();
+  liveMicMonitorGain.gain.value = 0; // <<-- key line: start muted
+  // connect mic dry + effects into the monitor gain
+  dryGain.connect(liveMicMonitorGain);
+  fxSumGain.connect(liveMicMonitorGain);
+  // and route monitor to output (will be silent until gain>0)
+  liveMicMonitorGain.connect(audioCtx.destination);
 
   hideMsg();
-}
 
-function toggleEQ(enable){
-  if (!micSource) return;
-  if (enable && !eq){
-    eq = {
-      low: audioCtx.createBiquadFilter(), mid: audioCtx.createBiquadFilter(), high: audioCtx.createBiquadFilter()
-    };
-    eq.low.type='lowshelf'; eq.low.frequency.value=180; eq.low.gain.value=eqLowGain;
-    eq.mid.type='peaking';  eq.mid.frequency.value=eqMidFreq; eq.mid.Q.value=eqMidQ; eq.mid.gain.value=eqMidGain;
-    eq.high.type='highshelf'; eq.high.frequency.value=4500; eq.high.gain.value=eqHighGain;
-
-    try{ micSource.disconnect(); }catch{}
-    micSource.connect(eq.low); eq.low.connect(eq.mid); eq.mid.connect(eq.high);
-    eq.high.connect(dryGain); eq.high.connect(delayNode); eq.high.connect(reverbPreDelay); eq.high.connect(flangerDelay);
-  } else if (!enable && eq){
-    try{ eq.low.disconnect(); eq.mid.disconnect(); eq.high.disconnect(); }catch{}
-    try{ micSource.disconnect(); }catch{}
-    micSource.connect(dryGain); micSource.connect(delayNode); micSource.connect(reverbPreDelay); micSource.connect(flangerDelay);
-    eq=null;
+  // --- Wire monitor button (safe to call multiple times; wires only once) ---
+  const monitorBtn = document.querySelector('#monitorBtn');
+  if (monitorBtn && !monitorBtn._monitorWired) {
+    monitorBtn._monitorWired = true;
+    // ensure current UI matches state
+    monitorBtn.classList.toggle('active', liveMicMonitoring);
+    monitorBtn.textContent = liveMicMonitoring ? 'Live MIC ON' : 'Live MIC OFF';
+    addTap(monitorBtn, () => {
+      // flip state and set gain smoothly
+      liveMicMonitoring = !liveMicMonitoring;
+      // ramp the gain a little for click-free change
+      const now = audioCtx.currentTime;
+      liveMicMonitorGain.gain.cancelScheduledValues(now);
+      liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, now);
+      liveMicMonitorGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
+      monitorBtn.classList.toggle('active', liveMicMonitoring);
+      monitorBtn.textContent = liveMicMonitoring ? 'Live MIC ON' : 'Live MIC OFF';
+    });
   }
-}
-
-function updateDelayFromTempo(){
-  if (delaySyncMode !== 'note') return;
-  const q = quarterSecForBPM(masterBPM || 120);
-  const mult = applyVariant(NOTE_MULT[delayDivision]||0.5, delayVariant);
-  delayNode.delayTime.value = clamp(q*mult, 0.001, 2.0);
-}
 
 // ======= BEFORE-FX BUTTONS + POPUP =======
 const beforeFXBtns = {
