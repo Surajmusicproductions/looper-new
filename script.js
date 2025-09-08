@@ -7,6 +7,45 @@
 */
 
 let audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+
+// Recommend serving via localhost/https — file:// will usually fail for Worklets
+if (window.location.protocol === 'file:') {
+  console.warn('Page loaded via file:// — AudioWorklet modules often fail. Serve via http://localhost or HTTPS.');
+  showMsg('⚠️ Detected file:// URL — run a local server (e.g. `python -m http.server` or VSCode Live Server) and reload the page.', '#ffb86b');
+}
+
+// STEP 2: Load the AudioWorklet (robust loader with diagnostics)
+(async ()=>{
+  try {
+    if (!audioCtx || !audioCtx.audioWorklet) {
+      console.error('AudioWorklet API is not available on audioCtx.');
+      showMsg('❌ AudioWorklet not supported in this browser/context. Use latest Chrome/Edge or run on http://localhost or https.', '#ff4444');
+      return;
+    }
+
+    // Build a robust URL for the module so relative paths work when served from different bases
+    // Use new URL(...) to resolve relative to the current page location.
+    const moduleURL = new URL('recorder-processor.js', window.location.href).href;
+
+    // Helpful debug: log the exact URL we will fetch
+    console.log('Loading AudioWorklet module from:', moduleURL);
+
+    // Try load and expose any underlying error message to console + UI
+    await audioCtx.audioWorklet.addModule(moduleURL);
+    console.log('AudioWorklet processor loaded successfully.');
+  } catch (e) {
+    console.error('Failed to load recorder-processor.js — full error:', e);
+
+    // Provide a helpful message to the user with the underlying error text (escaped)
+    const detail = e && e.message ? e.message : String(e);
+    showMsg(`❌ Could not load audio recorder component:<br><small>${detail}</small>`, '#ff4444');
+
+    // Extra console hints for debugging common causes
+    console.warn('Check: 1) Are you serving the page over http://localhost or https? 2) Is recorder-processor.js reachable (Network tab)? 3) Is MIME type application/javascript? 4) Is there a syntax error inside recorder-processor.js? 5) Is the browser up-to-date and supports AudioWorklet?');
+  }
+})();
+
+
 let micStream = null, micSource = null;
 
 // ======= GLOBAL (Before-FX) GRAPH =======
@@ -185,6 +224,8 @@ async function ensureMic(){
     });
   }
 
+} // NOTE: End of ensureMic(), typo in original file fixed.
+
 // ======= BEFORE-FX BUTTONS + POPUP =======
 const beforeFXBtns = {
   delay:  $('#fxBeforeBtn_delay'),
@@ -361,7 +402,12 @@ class Looper {
     this.stateDisplay = $('#stateDisplay'+index);
     this.recordKey = recordKey; this.stopKey = stopKey;
     this.state = 'ready';
-    this.mediaRecorder = null; this.chunks = [];
+
+    // MediaRecorder for overdubs, Worklet for main recording
+    this.mediaRecorder = null;
+    this.chunks = [];
+    this.workletNode = null;
+
     this.loopBuffer = null; this.sourceNode = null;
     this.loopStartTime = 0; this.loopDuration = 0;
     this.overdubChunks = [];
@@ -409,9 +455,81 @@ class Looper {
 
     const fxBtn = $('#fxMenuBtn' + index);
     if (fxBtn) fxBtn.addEventListener('click', () => openTrackFxMenu(this.index));
-  } // <<< --- CORRECTED: Constructor ends here
+  }
 
-  // <<< --- CORRECTED: All methods are now outside the constructor
+  // STEP 3: Add helper methods to Looper
+  async _startWorkletRecording(lenSec){
+    this.state='recording'; this.updateUI();
+    this.loopBuffer = null;
+    this.targetLenSec = lenSec;
+    this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs:1, channelCount:2 });
+    dryGain.connect(this.workletNode);
+    fxSumGain.connect(this.workletNode);
+    this.workletNode.port.postMessage({ cmd:'reset' });
+
+    const start = audioCtx.currentTime;
+    const animate = () => {
+      if (this.state==='recording'){
+        const pct = (audioCtx.currentTime - start) / lenSec;
+        this.setRing(Math.min(pct,1));
+        if (pct < 1) requestAnimationFrame(animate);
+      }
+    };
+    animate();
+
+    setTimeout(()=> this._stopWorkletRecording(), lenSec*1000);
+  }
+
+  async _stopWorkletRecording(){
+    if (!this.workletNode) return;
+    this.state='playing'; this.updateUI();
+
+    const node = this.workletNode;
+    node.port.onmessage = (e)=>{
+      if (e.data?.cmd==='dump'){
+        const { channels, length, sampleRate } = e.data;
+        if (length===0){ return; }
+        const buffer = audioCtx.createBuffer(channels.length, length, sampleRate);
+        channels.forEach((data, ch)=> buffer.getChannelData(ch).set(data));
+
+        // FIX #3: Trim/Pad loop buffers to prevent drift
+        const sr = sampleRate;
+        let targetSamples;
+        if (this.index === 1) {
+          targetSamples = Math.round(this.targetLenSec * sr);
+        } else {
+          targetSamples = Math.round(masterLoopDuration * sr * this.divider);
+        }
+
+        if (buffer.length !== targetSamples) {
+          const out = audioCtx.createBuffer(buffer.numberOfChannels, targetSamples, sr);
+          for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+            out.getChannelData(ch).set(buffer.getChannelData(ch).subarray(0, targetSamples));
+          }
+          this.loopBuffer = out;
+          this.loopDuration = out.duration;
+        } else {
+          this.loopBuffer = buffer;
+          this.loopDuration = buffer.duration;
+        }
+
+        if (this.index===1){
+          masterLoopDuration=this.loopDuration;
+          masterBPM = Math.round((60/this.loopDuration)*4);
+          // FIX #2: Uncomment updateDelayFromTempo()
+          updateDelayFromTempo(); // keep delay in sync with BPM
+          masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
+          for (let k=2;k<=4;k++) loopers[k].disable(false);
+        }
+        this.startPlayback();
+      }
+    };
+    node.port.postMessage({ cmd:'dump' });
+
+    try { dryGain.disconnect(node); fxSumGain.disconnect(node); node.disconnect(); } catch {}
+    this.workletNode = null;
+  }
+
   setLED(color){
     const map={green:'#22c55e', red:'#e11d48', orange:'#f59e0b', gray:'#6b7280'};
     this.ledRing.style.stroke=map[color]||'#fff';
@@ -462,65 +580,58 @@ class Looper {
   }
 
   async phaseLockedRecord(){
-    if (!processedStream) await ensureMic();
-    if (this.index===1 || !masterIsSet){ await this.startRecording(); return; }
-    this.state='waiting'; this.updateUI();
-    const now = audioCtx.currentTime, master = loopers[1];
-    const elapsed = (now - master.loopStartTime) % masterLoopDuration;
-    const toNext = masterLoopDuration - elapsed;
-    setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
+  if (this.index===1 || !masterIsSet){
+    await this.startRecording();
+    return;
   }
+  this.state='waiting'; this.updateUI();
+  const now = audioCtx.currentTime, master = loopers[1];
+  const elapsed = (now - master.loopStartTime) % masterLoopDuration;
+  const toNext = masterLoopDuration - elapsed;
+  setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
+}
 
-  async _startPhaseLockedRecording(len){
-    this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
-    const start=Date.now(), self=this;
-    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/(len*1000); self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
-    setTimeout(()=>{ if (this.state==='recording') self.stopRecordingAndPlay(); }, len*1000);
-  }
+// STEP 4: Replace MediaRecorder calls
+async _startPhaseLockedRecording(len){
+  this._startWorkletRecording(len);
+}
 
-  async startRecording(){
-    if (!processedStream) await ensureMic();
-    if (this.index>=2 && !masterIsSet) return;
-    this.state='recording'; this.updateUI();
-    this.chunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
-    this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.chunks.push(e.data); };
-    this.mediaRecorder.start();
-    const start=Date.now(), self=this; const max=(this.index===1)?60000:(masterLoopDuration? masterLoopDuration*this.divider*1000 : 12000);
-    (function anim(){ if (self.state==='recording'){ const pct=(Date.now()-start)/max; self.setRing(Math.min(pct,1)); if (pct<1) requestAnimationFrame(anim); if (pct>=1) self.stopRecordingAndPlay(); }})();
-  }
+async startRecording(){
+  if (this.index>=2 && !masterIsSet) return;
+  const max = (this.index===1) ? 60 : (masterLoopDuration? masterLoopDuration*this.divider : 12);
+  this._startWorkletRecording(max);
+}
 
-  async stopRecordingAndPlay(){
-    if (!this.mediaRecorder) return;
-    this.state='playing'; this.updateUI();
-    this.mediaRecorder.onstop = async ()=>{
-      const blob=new Blob(this.chunks,{type:'audio/webm'}); const buf=await blob.arrayBuffer();
-      audioCtx.decodeAudioData(buf, buffer=>{
-        this.loopBuffer=buffer; this.loopDuration=buffer.duration;
-        if (this.index===1){
-          masterLoopDuration=this.loopDuration;
-          masterBPM = Math.round((60/this.loopDuration)*4);
-          updateDelayFromTempo();
-          masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
-          for (let k=2;k<=4;k++) loopers[k].disable(false);
-        }
-        this.startPlayback();
-      });
-    };
-    this.mediaRecorder.stop();
-  }
+async stopRecordingAndPlay(){
+  this._stopWorkletRecording();
+}
 
-  abortRecording(){
+abortRecording(){
+    // FIX #1: Duplicate cleanup in abortRecording()
+    // Abort for worklet
+    if (this.workletNode) {
+        try {
+            this.workletNode.port.postMessage({ cmd:'reset' });
+            dryGain.disconnect(this.workletNode);
+            fxSumGain.disconnect(this.workletNode);
+            this.workletNode.disconnect();
+        } catch {}
+        this.workletNode = null;
+    }
+    // Abort for MediaRecorder (used in overdub)
     if (this.mediaRecorder && this.state==='recording'){
       try {
         this.mediaRecorder.ondataavailable = null;
         this.mediaRecorder.onstop = null;
         this.mediaRecorder.stop();
       } catch {}
-      this.mediaRecorder=null; this.chunks=[]; this.state='ready'; this.loopBuffer=null; this.loopDuration=0; this.setRing(0); this.updateUI();
+      this.mediaRecorder=null; this.chunks=[];
     }
+    this.state='ready';
+    this.loopBuffer=null;
+    this.loopDuration=0;
+    this.setRing(0);
+    this.updateUI();
   }
 
   _applyPitchIfAny(){
@@ -573,7 +684,6 @@ class Looper {
       if (!fx.bypass){ try{ head.connect(fx.nodes.input); }catch{}; head = fx.nodes.output; }
     }
     try{ head.connect(this.gainNode); }catch{}
-    // MODIFICATION: Connect to masterBus instead of audioCtx.destination
     this.gainNode.connect(masterBus);
   }
 
@@ -610,6 +720,7 @@ class Looper {
     setTimeout(()=>this.startOverdubRecording(), (this.loopDuration - elapsed)*1000);
   }
 
+  // STEP 5: This method remains unchanged, using MediaRecorder
   startOverdubRecording(){
     this.overdubStartTime = audioCtx.currentTime;
     this.overdubChunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
@@ -621,6 +732,7 @@ class Looper {
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
 
+  // STEP 5: This method remains unchanged, using MediaRecorder
   finishOverdub(){
     if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
       this.mediaRecorder.onstop = async ()=>{
@@ -648,7 +760,7 @@ class Looper {
       masterLoopDuration=null; masterBPM=null; masterIsSet=false; bpmLabel.textContent='BPM: --';
       for (let k=2;k<=4;k++) loopers[k].disable(true);
       for (let k=2;k<=4;k++) loopers[k].clearLoop();
-      updateDelayFromTempo();
+      // updateDelayFromTempo(); // This function was missing
     }
   }
 
@@ -666,7 +778,7 @@ class Looper {
       requestAnimationFrame(this._overdubAnimate.bind(this));
     }
   }
-} // <<< --- CORRECTED: Looper class ends here
+}
 
 // ======= BUILD LOOPERS + KEYBINDS =======
 const keyMap = [{rec:'w',stop:'s'},{rec:'e',stop:'d'},{rec:'r',stop:'f'},{rec:'t',stop:'g'}];
@@ -809,7 +921,7 @@ function renderFxParamsBody(fx){
 function wireFxParams(lp, fx){
   if (fx.type==='Pitch'){ $('#pSem').addEventListener('input', e=>{ fx.params.semitones = parseInt(e.target.value,10); $('#pSemVal').textContent = fx.params.semitones; lp.pitchSemitones = fx.params.semitones; if (lp.state==='playing') lp._applyPitchIfAny(); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='LowPass'){ $('#lpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#lpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#lpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
-  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#hpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
+  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Pan'){ $('#pan').addEventListener('input', e=>{ fx.params.pan = parseFloat(e.target.value); $('#panVal').textContent = fx.params.pan.toFixed(2); if (fx.nodes?.panner) fx.nodes.panner.pan.setTargetAtTime(fx.params.pan, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='Delay'){ $('#dTime').addEventListener('input', e=>{ fx.params.timeSec = parseInt(e.target.value,10)/1000; $('#dTimeVal').textContent = `${parseInt(e.target.value,10)} ms`; if (fx.nodes?.d) fx.nodes.d.delayTime.setTargetAtTime(fx.params.timeSec, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#dFb').addEventListener('input', e=>{ fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01); }); $('#dMix').addEventListener('input', e=>{ fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.wet) fx.nodes.wet.gain.setTargetAtTime(clamp(fx.params.mix,0,1), audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Compressor'){ $('#cTh').addEventListener('input', e=>{ fx.params.threshold = parseInt(e.target.value,10); $('#cThVal').textContent = fx.params.threshold+' dB'; if (fx.nodes?.comp) fx.nodes.comp.threshold.setTargetAtTime(fx.params.threshold, audioCtx.currentTime, 0.01); }); $('#cRa').addEventListener('input', e=>{ fx.params.ratio = parseFloat(e.target.value); $('#cRaVal').textContent = fx.params.ratio+':1'; if (fx.nodes?.comp) fx.nodes.comp.ratio.setTargetAtTime(fx.params.ratio, audioCtx.currentTime, 0.01); }); $('#cKn').addEventListener('input', e=>{ fx.params.knee = parseInt(e.target.value,10); $('#cKnVal').textContent = fx.params.knee+' dB'; if (fx.nodes?.comp) fx.nodes.comp.knee.setTargetAtTime(fx.params.knee, audioCtx.currentTime, 0.01); }); $('#cAt').addEventListener('input', e=>{ fx.params.attack = parseFloat(e.target.value)/1000; $('#cAtVal').textContent = (fx.params.attack*1000).toFixed(1)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.attack.setTargetAtTime(fx.params.attack, audioCtx.currentTime, 0.01); }); $('#cRl').addEventListener('input', e=>{ fx.params.release = parseFloat(e.target.value)/1000; $('#cRlVal').textContent = (fx.params.release*1000).toFixed(0)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.release.setTargetAtTime(fx.params.release, audioCtx.currentTime, 0.01); }); }
@@ -830,6 +942,19 @@ if (monitorBtn){
 
 // ======= BEFORE-FX WIRING & AUDIO UNLOCK =======
 wireBeforeFX();
+
+// ---------- Startup hint (show initial instruction) ----------
+window.addEventListener('DOMContentLoaded', () => {
+  // Show a friendly instruction so users know to press a Record button to allow microphone access
+  showMsg('🎤 Click any Record button (or the top "Record Mix") to allow microphone access.', '#22ff88');
+
+  // Small visual hint under the mix record area if present
+  const hintEl = document.getElementById('mixRecHint');
+  if (hintEl) hintEl.textContent = 'Tip: Click Record to allow mic access and start recording.';
+
+  // Remove the hint after a short time (but leave it if user interacts)
+  setTimeout(() => { try { hideMsg(); } catch (e){} }, 3500);
+});
 
 function resumeAudio(){ if (audioCtx.state==='suspended'){ audioCtx.resume(); hideMsg(); } }
 window.addEventListener('click', resumeAudio, { once:true });
@@ -880,7 +1005,6 @@ async function blobToArrayBuffer(blob){
 }
 
 async function encodeMp3FromWebm(webmBlob){
-  // Try dynamic load of lamejs (CDN). If blocked, return null and we’ll fall back to webm.
   function loadLame(){
     return new Promise((resolve,reject)=>{
       if (window.lamejs) return resolve();
@@ -895,10 +1019,9 @@ async function encodeMp3FromWebm(webmBlob){
   try{
     await loadLame();
   }catch{
-    return null; // fallback to WebM save
+    return null;
   }
 
-  // Decode webm -> PCM via WebAudio, then encode MP3
   const arr = await blobToArrayBuffer(webmBlob);
   const audioBuf = await audioCtx.decodeAudioData(arr);
 
@@ -907,11 +1030,10 @@ async function encodeMp3FromWebm(webmBlob){
   const left = audioBuf.getChannelData(0);
   const right = numCh > 1 ? audioBuf.getChannelData(1) : null;
 
-  const mp3enc = new lamejs.Mp3Encoder(numCh, sr, 128); // 128 kbps
+  const mp3enc = new lamejs.Mp3Encoder(numCh, sr, 128);
   const blockSize = 1152;
   let mp3Data = [];
 
-  // Interleave to Int16 per channel
   function floatTo16BitPCM(input){
     const out = new Int16Array(input.length);
     for (let i=0;i<input.length;i++){
@@ -938,7 +1060,6 @@ async function encodeMp3FromWebm(webmBlob){
 async function saveMasterRecording(){
   const webmBlob = new Blob(mixChunks, { type:'audio/webm' });
 
-  // Ask user: try MP3?
   const wantMp3 = confirm('Stop recorded. Export as MP3?\n(OK = MP3, Cancel = WebM)');
 
   if (wantMp3){
@@ -958,7 +1079,6 @@ async function saveMasterRecording(){
     }
   }
 
-  // Fallback: save WebM
   const a = document.createElement('a');
   a.href = URL.createObjectURL(webmBlob);
   a.download = `looper-mix-${Date.now()}.webm`;
@@ -968,11 +1088,66 @@ async function saveMasterRecording(){
   setTimeout(hideMsg, 1500);
 }
 
-// Wire the button
 const mixBtn = document.getElementById('mixRecBtn');
 if (mixBtn){
-  addTap(mixBtn, ()=>{
+  addTap(mixBtn, async () => {
+    // Ensure mic is requested within the user gesture
+    try {
+      await ensureMic();
+    } catch (e) {
+      // ensureMic already shows error messages; abort if user denied
+      return;
+    }
+
     if (!mixRecording) startMasterRecording();
     else stopMasterRecording();
   });
+}
+
+function updateDelayFromTempo() {
+    if (!masterBPM || delaySyncMode !== 'note') return;
+    const quarter = quarterSecForBPM(masterBPM);
+    const mult = NOTE_MULT[delayDivision] || 0.5;
+    const finalMult = applyVariant(mult, delayVariant);
+    const delayTime = quarter * finalMult;
+    if (delayNode) {
+        delayNode.delayTime.value = clamp(delayTime, 0, 2.0);
+    }
+}
+
+function toggleEQ(enabled) {
+    if (enabled && !eq) {
+        // Create EQ nodes and connect them
+        const low = audioCtx.createBiquadFilter();
+        low.type = 'lowshelf';
+        low.frequency.value = 250;
+        low.gain.value = eqLowGain;
+
+        const mid = audioCtx.createBiquadFilter();
+        mid.type = 'peaking';
+        mid.frequency.value = eqMidFreq;
+        mid.Q.value = eqMidQ;
+        mid.gain.value = eqMidGain;
+
+        const high = audioCtx.createBiquadFilter();
+        high.type = 'highshelf';
+        high.frequency.value = 4000;
+        high.gain.value = eqHighGain;
+
+        // Disconnect direct path and insert EQ
+        micSource.disconnect(dryGain);
+        micSource.connect(low);
+        low.connect(mid);
+        mid.connect(high);
+        high.connect(dryGain);
+
+        eq = { low, mid, high, connected: true };
+
+    } else if (!enabled && eq && eq.connected) {
+        // Disconnect EQ and restore direct path
+        micSource.disconnect(eq.low);
+        eq.high.disconnect(dryGain);
+        micSource.connect(dryGain);
+        eq.connected = false;
+    }
 }
