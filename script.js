@@ -7,7 +7,12 @@
    Patched based on user feedback to fix live monitor echo and consolidate code.
 */
 
-let audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+// pick latencyHint based on platform (reduce underruns on weaker mobile devices)
+const _isMobile = /Mobi|Android/i.test(navigator.userAgent);
+let audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+  latencyHint: _isMobile ? 'playback' : 'interactive'
+});
+
 
 // Recommend serving via localhost/https — file:// will usually fail for Worklets
 if (window.location.protocol === 'file:') {
@@ -54,7 +59,7 @@ let dryGain, fxSumGain, mixDest, processedStream;
 
 // Reverb (Before)
 let convolver, reverbPreDelay, reverbWet;
-let reverbMix = 0.25, reverbRoomSeconds = 2.5, reverbDecay = 2.0, reverbPreDelayMs = 20;
+let reverbMix = 0.25, reverbRoomSeconds = 1.2, reverbDecay = 1.8, reverbPreDelayMs = 20;
 
 // Delay (Before)
 let delayNode, delayFeedback, delayWet;
@@ -160,25 +165,20 @@ async function ensureMic(){
   reverbPreDelay = audioCtx.createDelay(1.0); reverbPreDelay.delayTime.value = reverbPreDelayMs/1000;
   convolver = audioCtx.createConvolver(); convolver.normalize = true; convolver.buffer = makeReverbImpulse(reverbRoomSeconds, reverbDecay);
   reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0; // CORRECT: Start wet gain at 0
-  micSource.connect(reverbPreDelay); reverbPreDelay.connect(convolver); convolver.connect(reverbWet); reverbWet.connect(fxSumGain);
+  // Note: connection happens on-demand in wireBeforeFX
 
   // --- Delay path ---
   delayNode = audioCtx.createDelay(2.0);
   delayFeedback = audioCtx.createGain(); delayFeedback.gain.value = delayFeedbackAmt;
   delayWet = audioCtx.createGain(); delayWet.gain.value = 0; // CORRECT: Start wet gain at 0
   delayNode.connect(delayFeedback); delayFeedback.connect(delayNode);
-  micSource.connect(delayNode); delayNode.connect(delayWet); delayWet.connect(fxSumGain);
+  // Note: connection happens on-demand in wireBeforeFX
 
   // --- Flanger path ---
   flangerDelay = audioCtx.createDelay(0.05);
   flangerWet = audioCtx.createGain(); flangerWet.gain.value = 0; // CORRECT: Start wet gain at 0
   flangerFeedback = audioCtx.createGain(); flangerFeedback.gain.value = flangerFeedbackAmt;
-  flangerLFO = audioCtx.createOscillator(); flangerLFO.type='sine'; flangerLFO.frequency.value = flangerRateHz;
-  flangerDepthGain = audioCtx.createGain(); flangerDepthGain.gain.value = flangerDepthMs/1000;
-  flangerLFO.connect(flangerDepthGain); flangerDepthGain.connect(flangerDelay.delayTime);
-  flangerDelay.connect(flangerWet); flangerWet.connect(fxSumGain);
-  flangerDelay.connect(flangerFeedback); flangerFeedback.connect(flangerDelay);
-  micSource.connect(flangerDelay); flangerLFO.start();
+  // Note: LFO created/connected on-demand in wireBeforeFX
 
   // EQ (created when toggled on)
   eq = null;
@@ -366,8 +366,8 @@ function wireBeforeFxTab(tab){
     syncUI();
   }
   if (tab==='flanger'){
-    $('#flRate').addEventListener('input', e=>{ flangerRateHz = parseFloat(e.target.value); flangerLFO.frequency.value = flangerRateHz; $('#flRateVal').textContent = flangerRateHz.toFixed(2)+' Hz'; });
-    $('#flDepth').addEventListener('input', e=>{ flangerDepthMs = parseFloat(e.target.value); flangerDepthGain.gain.value = flangerDepthMs/1000; $('#flDepthVal').textContent = flangerDepthMs.toFixed(2)+' ms'; });
+    $('#flRate').addEventListener('input', e=>{ flangerRateHz = parseFloat(e.target.value); if(flangerLFO) flangerLFO.frequency.value = flangerRateHz; $('#flRateVal').textContent = flangerRateHz.toFixed(2)+' Hz'; });
+    $('#flDepth').addEventListener('input', e=>{ flangerDepthMs = parseFloat(e.target.value); if(flangerDepthGain) flangerDepthGain.gain.value = flangerDepthMs/1000; $('#flDepthVal').textContent = flangerDepthMs.toFixed(2)+' ms'; });
     $('#flFb').addEventListener('input', e=>{ flangerFeedbackAmt = parseFloat(e.target.value)/100; flangerFeedback.gain.value = clamp(flangerFeedbackAmt, -0.95, 0.95); $('#flFbVal').textContent = Math.round(flangerFeedbackAmt*100)+'%'; });
     $('#flMix').addEventListener('input', e=>{ flangerMix = parseFloat(e.target.value)/100; flangerWet.gain.value = beforeState.flanger ? flangerMix : 0; $('#flMixVal').textContent = Math.round(flangerMix*100)+'%'; });
   }
@@ -387,7 +387,22 @@ function wireBeforeFX(){
       await ensureMic();
       beforeState.reverb = !beforeState.reverb;
       beforeFXBtns.reverb.classList.toggle('active', beforeState.reverb);
-      reverbWet.gain.value = beforeState.reverb ? reverbMix : 0;
+
+      if (beforeState.reverb) {
+        // enable reverb: ensure path connected and set wet level
+        try {
+          micSource.connect(reverbPreDelay);
+          reverbPreDelay.connect(convolver);
+          convolver.connect(reverbWet);
+          reverbWet.connect(fxSumGain);
+        } catch (e) { console.warn('Reverb connect failed', e); }
+        reverbWet.gain.setValueAtTime(reverbMix, audioCtx.currentTime);
+      } else {
+        // disable reverb: mute wet and disconnect input to save CPU
+        try { reverbWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
+        try { micSource.disconnect(reverbPreDelay); } catch(e){/* ignore */ }
+      }
+
       openBeforeFxPopup('reverb');
     });
   }
@@ -396,7 +411,20 @@ function wireBeforeFX(){
       await ensureMic();
       beforeState.delay = !beforeState.delay;
       beforeFXBtns.delay.classList.toggle('active', beforeState.delay);
-      delayWet.gain.value = beforeState.delay ? delayMix : 0;
+
+      if (beforeState.delay) {
+        try {
+          micSource.connect(delayNode);
+          delayNode.connect(delayWet);
+          delayWet.connect(fxSumGain);
+          delayFeedback.connect(delayNode); // ensure feedback loop present
+        } catch(e){ console.warn('Delay connect failed', e); }
+        delayWet.gain.setValueAtTime(delayMix, audioCtx.currentTime);
+      } else {
+        try { delayWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
+        try { micSource.disconnect(delayNode); } catch(e){}
+      }
+
       openBeforeFxPopup('delay');
     });
   }
@@ -405,7 +433,35 @@ function wireBeforeFX(){
       await ensureMic();
       beforeState.flanger = !beforeState.flanger;
       beforeFXBtns.flanger.classList.toggle('active', beforeState.flanger);
-      flangerWet.gain.value = beforeState.flanger ? flangerMix : 0;
+
+      if (beforeState.flanger) {
+        // create and start an oscillator for LFO each enable (clean lifecycle)
+        try {
+          flangerLFO = audioCtx.createOscillator();
+          flangerLFO.type = 'sine';
+          flangerLFO.frequency.value = flangerRateHz;
+          flangerDepthGain = audioCtx.createGain();
+          flangerDepthGain.gain.value = flangerDepthMs/1000;
+          flangerLFO.connect(flangerDepthGain);
+          flangerDepthGain.connect(flangerDelay.delayTime);
+
+          micSource.connect(flangerDelay);
+          flangerDelay.connect(flangerWet);
+          flangerWet.connect(fxSumGain);
+          flangerDelay.connect(flangerFeedback);
+          flangerFeedback.connect(flangerDelay);
+
+          flangerLFO.start();
+        } catch (e) { console.warn('Flanger enable failed', e); }
+        flangerWet.gain.setValueAtTime(flangerMix, audioCtx.currentTime);
+      } else {
+        try { flangerWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
+        try { micSource.disconnect(flangerDelay); } catch(e){}
+        // stop and disconnect LFO
+        try { flangerLFO.stop(); flangerLFO.disconnect(); } catch (e) {}
+        flangerLFO = null;
+      }
+
       openBeforeFxPopup('flanger');
     });
   }
@@ -512,10 +568,24 @@ class Looper {
     // Try to create the AudioWorkletNode (safe, but don't block visuals if it fails)
     try {
       this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
-      // CORRECTED WIRING: wire audio into worklet only if creation succeeded — record DRY only to avoid capturing delayed/reverbed copies
-      dryGain.connect(this.workletNode);
-      // fxSumGain.connect(this.workletNode); // intentionally disabled — do not record processed before-FX
+
+      // If any before-FX is enabled, record the processed (fxSumGain) signal so loops include before-FX.
+      // Otherwise, record dryGain (previous behavior).
+      try {
+        const shouldRecordProcessed = beforeState.reverb || beforeState.delay || beforeState.flanger || beforeState.eq5;
+        if (shouldRecordProcessed) {
+          // try to connect processed bus first
+          fxSumGain.connect(this.workletNode);
+        } else {
+          dryGain.connect(this.workletNode);
+        }
+      } catch (e) {
+        console.warn('Recorder worklet connect failed, falling back to dryGain:', e);
+        try { dryGain.connect(this.workletNode); } catch (e2) { console.error('Fallback connect failed', e2); }
+      }
+
       this.workletNode.port.postMessage({ cmd: 'reset' });
+
 
       // keep previous behavior: schedule stop when time's up
       setTimeout(()=> this._stopWorkletRecording(), lenSec * 1000);
@@ -526,7 +596,7 @@ class Looper {
       // still schedule a fallback stop so the ring completes
       setTimeout(() => {
         // if we ever created part of the node, try to stop/cleanup
-        try { if (this.workletNode) { dryGain.disconnect(this.workletNode); this.workletNode.disconnect(); } } catch (e) {}
+        try { if (this.workletNode) { dryGain.disconnect(this.workletNode); fxSumGain.disconnect(this.workletNode); this.workletNode.disconnect(); } } catch (e) {}
         // move to 'playing' state so UI updates (playback won't start because there's no buffer)
         this.state = 'playing';
         this.updateUI();
@@ -584,7 +654,9 @@ class Looper {
     };
     node.port.postMessage({ cmd:'dump' });
 
-    try { dryGain.disconnect(node); node.disconnect(); } catch {}
+    try { dryGain.disconnect(node); } catch(e) {}
+    try { fxSumGain.disconnect(node); } catch(e) {}
+    try { node.disconnect(); } catch(e) {}
     this.workletNode = null;
   }
 
@@ -668,6 +740,7 @@ abortRecording(){
         try {
             this.workletNode.port.postMessage({ cmd:'reset' });
             dryGain.disconnect(this.workletNode);
+            fxSumGain.disconnect(this.workletNode);
             this.workletNode.disconnect();
         } catch {}
         this.workletNode = null;
@@ -1217,7 +1290,7 @@ function toggleEQ(enabled) {
         high.gain.value = eqHighGain;
 
         // Disconnect direct path and insert EQ
-        micSource.disconnect(dryGain);
+        try { micSource.disconnect(dryGain); } catch(e){}
         micSource.connect(low);
         low.connect(mid);
         mid.connect(high);
@@ -1227,8 +1300,8 @@ function toggleEQ(enabled) {
 
     } else if (!enabled && eq && eq.connected) {
         // Disconnect EQ and restore direct path
-        micSource.disconnect(eq.low);
-        eq.high.disconnect(dryGain);
+        try { micSource.disconnect(eq.low); } catch(e){}
+        try { eq.high.disconnect(dryGain); } catch(e){}
         micSource.connect(dryGain);
         eq.connected = false;
     }
