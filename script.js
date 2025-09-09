@@ -2,9 +2,10 @@
    - Before-FX: popup with per-effect parameters
    - After-FX: menu popup to add/remove/reorder effects (series), second popup to tweak parameters
    - Up/Down reordering with numbers
-   - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
+   - Pitch (playbackRate) available in After-FX; live input pitch shifting is now implemented with WASM
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
    Patched based on user feedback to fix live monitor echo and consolidate code.
+   WASM Pitch Shifter Integration: 2025-09-09
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -20,7 +21,7 @@ if (window.location.protocol === 'file:') {
   showMsg('⚠️ Detected file:// URL — run a local server (e.g. `python -m http.server` or VSCode Live Server) and reload the page.', '#ffb86b');
 }
 
-// STEP 2: Load the AudioWorklet (robust loader with diagnostics)
+// STEP 2: Load AudioWorklets (robust loader with diagnostics)
 (async ()=>{
   try {
     if (!audioCtx || !audioCtx.audioWorklet) {
@@ -29,25 +30,22 @@ if (window.location.protocol === 'file:') {
       return;
     }
 
-    // Build a robust URL for the module so relative paths work when served from different bases
-    // Use new URL(...) to resolve relative to the current page location.
-    const moduleURL = new URL('recorder-processor.js', window.location.href).href;
+    const recorderModuleURL = new URL('recorder-processor.js', window.location.href).href;
+    const pitchShifterModuleURL = new URL('pitch-shifter-processor.js', window.location.href).href;
 
-    // Helpful debug: log the exact URL we will fetch
-    console.log('Loading AudioWorklet module from:', moduleURL);
+    console.log('Loading AudioWorklet module from:', recorderModuleURL);
+    await audioCtx.audioWorklet.addModule(recorderModuleURL);
+    console.log('Recorder processor loaded successfully.');
+    
+    console.log('Loading Pitch Shifter module from:', pitchShifterModuleURL);
+    await audioCtx.audioWorklet.addModule(pitchShifterModuleURL);
+    console.log('Pitch Shifter processor loaded successfully.');
 
-    // Try load and expose any underlying error message to console + UI
-    await audioCtx.audioWorklet.addModule(moduleURL);
-    console.log('AudioWorklet processor loaded successfully.');
   } catch (e) {
-    console.error('Failed to load recorder-processor.js — full error:', e);
-
-    // Provide a helpful message to the user with the underlying error text (escaped)
+    console.error('Failed to load an AudioWorklet processor — full error:', e);
     const detail = e && e.message ? e.message : String(e);
-    showMsg(`❌ Could not load audio recorder component:<br><small>${detail}</small>`, '#ff4444');
-
-    // Extra console hints for debugging common causes
-    console.warn('Check: 1) Are you serving the page over http://localhost or https? 2) Is recorder-processor.js reachable (Network tab)? 3) Is MIME type application/javascript? 4) Is there a syntax error inside recorder-processor.js? 5) Is the browser up-to-date and supports AudioWorklet?');
+    showMsg(`❌ Could not load an audio component:<br><small>${detail}</small>`, '#ff4444');
+    console.warn('Check: 1) Are you serving the page over http://localhost or https? 2) Is the .js file reachable (Network tab)? 3) Is the MIME type application/javascript? 4) Is there a syntax error inside the processor script? 5) Have you compiled the .wasm file correctly?');
   }
 })();
 
@@ -56,6 +54,10 @@ let micStream = null, micSource = null;
 
 // ======= GLOBAL (Before-FX) GRAPH =======
 let dryGain, fxSumGain, mixDest, processedStream;
+
+// NEW: Real-time pitch shifter node and state
+let pitchShifterNode = null;
+let livePitchSemitones = 0;
 
 // Reverb (Before)
 let convolver, reverbPreDelay, reverbWet;
@@ -78,7 +80,7 @@ let eq = null;
 let eqLowGain = 3, eqMidGain = 2, eqMidFreq = 1200, eqMidQ = 0.9, eqHighGain = 3;
 
 // Before-FX state (ON/OFF)
-const beforeState = { delay:false, reverb:false, flanger:false, eq5:false };
+const beforeState = { delay:false, reverb:false, flanger:false, eq5:false, pitch: false };
 
 // Live monitor
 let liveMicMonitorGain = null, liveMicMonitoring = false;
@@ -146,7 +148,6 @@ async function ensureMic(){
   }
   if (!navigator.mediaDevices?.getUserMedia) { showMsg('❌ Microphone not supported'); throw new Error('gUM'); }
   try {
-    // Use browser echo cancellation & noise suppression for cleaner live monitoring tests.
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -157,6 +158,16 @@ async function ensureMic(){
   } catch(e){ showMsg('❌ Microphone access denied'); throw e; }
 
   micSource = audioCtx.createMediaStreamSource(micStream);
+  
+  // *** NEW: Instantiate the Pitch Shifter Node ***
+  try {
+    pitchShifterNode = new AudioWorkletNode(audioCtx, 'pitch-shifter-processor');
+    console.log("Pitch Shifter AudioWorkletNode created successfully.");
+  } catch(e) {
+    console.error("Failed to create Pitch Shifter node:", e);
+    showMsg('❌ Could not create Pitch Shifter node. Check console.', '#ff4444');
+    return;
+  }
 
   dryGain = audioCtx.createGain();   dryGain.gain.value = 1;
   fxSumGain = audioCtx.createGain(); fxSumGain.gain.value = 1;
@@ -164,26 +175,25 @@ async function ensureMic(){
   // --- Reverb path ---
   reverbPreDelay = audioCtx.createDelay(1.0); reverbPreDelay.delayTime.value = reverbPreDelayMs/1000;
   convolver = audioCtx.createConvolver(); convolver.normalize = true; convolver.buffer = makeReverbImpulse(reverbRoomSeconds, reverbDecay);
-  reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0; // CORRECT: Start wet gain at 0
-  // Note: connection happens on-demand in wireBeforeFX
+  reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0;
 
   // --- Delay path ---
   delayNode = audioCtx.createDelay(2.0);
   delayFeedback = audioCtx.createGain(); delayFeedback.gain.value = delayFeedbackAmt;
-  delayWet = audioCtx.createGain(); delayWet.gain.value = 0; // CORRECT: Start wet gain at 0
+  delayWet = audioCtx.createGain(); delayWet.gain.value = 0;
   delayNode.connect(delayFeedback); delayFeedback.connect(delayNode);
-  // Note: connection happens on-demand in wireBeforeFX
 
   // --- Flanger path ---
   flangerDelay = audioCtx.createDelay(0.05);
-  flangerWet = audioCtx.createGain(); flangerWet.gain.value = 0; // CORRECT: Start wet gain at 0
+  flangerWet = audioCtx.createGain(); flangerWet.gain.value = 0;
   flangerFeedback = audioCtx.createGain(); flangerFeedback.gain.value = flangerFeedbackAmt;
-  // Note: LFO created/connected on-demand in wireBeforeFX
-
-  // EQ (created when toggled on)
+  
   eq = null;
 
-  micSource.connect(dryGain);
+  // *** UPDATED: Audio Routing Chain ***
+  // micSource -> pitchShifterNode -> dryGain -> other effects and destinations
+  micSource.connect(pitchShifterNode);
+  pitchShifterNode.connect(dryGain);
 
   // Recording stream (for overdubs)
   mixDest = audioCtx.createMediaStreamDestination();
@@ -195,66 +205,31 @@ async function ensureMic(){
   masterBus = audioCtx.createGain();
   masterBus.gain.value = 1;
 
-  // create mic->master gate and keep it muted by default
   micToMasterGain = audioCtx.createGain();
-  micToMasterGain.gain.value = 0; // safety: don't route mic to master until user explicitly enables
-
-  // route dry into the gate, then into masterBus (so we can open/close mic->master without changing other wiring)
+  micToMasterGain.gain.value = 0; 
   dryGain.connect(micToMasterGain);
   micToMasterGain.connect(masterBus);
 
-  // keep FX summed into master as before
   fxSumGain.connect(masterBus);
-
-  masterBus.connect(audioCtx.destination); // For listening
-  masterDest = audioCtx.createMediaStreamDestination(); // For recording
+  masterBus.connect(audioCtx.destination);
+  masterDest = audioCtx.createMediaStreamDestination();
   masterBus.connect(masterDest);
   masterStream = masterDest.stream;
 
-  // Live monitor (start MUTED to avoid headphone echo)
+  // Live monitor
   liveMicMonitorGain = audioCtx.createGain();
-  liveMicMonitorGain.gain.value = 0; // keep muted by default
+  liveMicMonitorGain.gain.value = 0; 
 
-  // === Start: monitor safety guard ===
-  // MONITOR_GUARD: only monitorBtn should change liveMicMonitorGain via safeSetGain()
-  // Prevent accidental programmatic unmute elsewhere in the code.
-  // Only the monitor button handler should ramp the monitor gain.
   liveMicMonitorGain._monitorControlOnly = true;
-
-  // helper to safely set/ramp the monitor gain (used by monitor button only)
   liveMicMonitorGain.safeSetGain = (value, when = audioCtx.currentTime, rampTime = 0.03) => {
-    // cancel any scheduled values and ramp smoothly
     liveMicMonitorGain.gain.cancelScheduledValues(when);
     liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, when);
     liveMicMonitorGain.gain.linearRampToValueAtTime(value, when + rampTime);
   };
-  // === End: monitor safety guard ===
-
-  // DEV WARNING: detect direct setValue attempts (non-blocking)
-  try {
-    const origSet = liveMicMonitorGain.gain.setValueAtTime.bind(liveMicMonitorGain.gain);
-    liveMicMonitorGain.gain.setValueAtTime = (v, when) => {
-      if (!liveMicMonitorGain._monitorControlOnly) {
-        console.warn('Monitor gain setValueAtTime called from unexpected code path', v, when);
-      }
-      return origSet(v, when);
-    };
-  } catch(e){ /* ignore in production */ }
-
-
-  // CORRECTED WIRING: Monitor ONLY the dry mic to avoid hearing delay/reverb/flanger
-  try {
-    // connect only the dry (unprocessed) mic to monitor to deliver a single clean signal
-    dryGain.connect(liveMicMonitorGain);
-    // NOTE: intentional — do NOT connect fxSumGain into the live monitor.
-    // fxSumGain.connect(liveMicMonitorGain); // intentionally disabled
-  } catch (e) {
-    console.warn('Monitor routing: connection failed', e);
-  }
-
-  // route monitor to output (silent until gain > 0)
+  
+  // Connect monitor to the output of the pitch shifter for real-time monitoring of the shifted signal
+  pitchShifterNode.connect(liveMicMonitorGain);
   liveMicMonitorGain.connect(audioCtx.destination);
-
 
   hideMsg();
 }
@@ -265,7 +240,7 @@ const beforeFXBtns = {
   reverb: $('#fxBeforeBtn_reverb'),
   flanger:$('#fxBeforeBtn_flanger'),
   eq5:    $('#fxBeforeBtn_eq5'),
-  pitch:  $('#fxBeforeBtn_pitch') // live pitch shifting not implemented
+  pitch:  $('#fxBeforeBtn_pitch') 
 };
 const fxBeforeParamsPopup = $('#fxBeforeParamsPopup');
 
@@ -273,7 +248,7 @@ function openBeforeFxPopup(tab='reverb'){
   fxBeforeParamsPopup.classList.remove('hidden');
   fxBeforeParamsPopup.innerHTML = `
     <div class="fx-popup-inner">
-      <h3>Before FX – ${tab.toUpperCase()}</h3>
+      <h3>Before FX – ${tab.replace('pitch','Pitch Shift').toUpperCase()}</h3>
       <div id="beforeFxBody">${renderBeforeFxTab(tab)}</div>
       <div style="margin-top:8px;">
         <button id="closeBeforeFx">Close</button>
@@ -342,7 +317,9 @@ function renderBeforeFxTab(tab){
       <input id="eqHigh" type="range" min="-12" max="12" value="${eqHighGain}"></label>
   `;
   if (tab==='pitch') return `
-    <p style="max-width:32ch;line-height:1.3;">Live input pitch shifting needs advanced DSP (AudioWorklet / phase vocoder). This build doesn’t include it. Use per-track <b>After-FX → Pitch (PlaybackRate)</b> for ±12 semitones on loops.</p>
+    <p style="max-width:32ch;line-height:1.3;">Shift the pitch of the live input in real-time. This effect is recorded into the loop.</p>
+    <label>Semitones <span id="livePitchVal">${livePitchSemitones}</span>
+      <input id="livePitch" type="range" min="-12" max="12" step="1" value="${livePitchSemitones}"></label>
   `;
   return '';
 }
@@ -378,10 +355,23 @@ function wireBeforeFxTab(tab){
     $('#eqMidQ').addEventListener('input', e=>{ eqMidQ=parseFloat(e.target.value); if(eq?.mid) eq.mid.Q.value=eqMidQ; $('#eqMidQVal').textContent = eqMidQ.toFixed(2); });
     $('#eqHigh').addEventListener('input', e=>{ eqHighGain=parseInt(e.target.value,10); if(eq?.high) eq.high.gain.value=eqHighGain; $('#eqHighVal').textContent = eqHighGain+' dB'; });
   }
+  if (tab==='pitch') {
+    $('#livePitch').addEventListener('input', e => {
+      livePitchSemitones = parseInt(e.target.value, 10);
+      $('#livePitchVal').textContent = livePitchSemitones;
+      
+      // Convert semitones to a pitch factor. 2^(semitones/12)
+      const pitchFactor = Math.pow(2, livePitchSemitones / 12);
+
+      // Send the new pitch factor to the worklet
+      if (pitchShifterNode) {
+        pitchShifterNode.port.postMessage({ type: 'setPitch', value: pitchFactor });
+      }
+    });
+  }
 }
 
 function wireBeforeFX(){
-  // Toggle and open popup to tweak
   if (beforeFXBtns.reverb){
     addTap(beforeFXBtns.reverb, async ()=>{
       await ensureMic();
@@ -389,20 +379,17 @@ function wireBeforeFX(){
       beforeFXBtns.reverb.classList.toggle('active', beforeState.reverb);
 
       if (beforeState.reverb) {
-        // enable reverb: ensure path connected and set wet level
         try {
-          micSource.connect(reverbPreDelay);
+          dryGain.connect(reverbPreDelay); // Connect from dryGain, post-pitch-shift
           reverbPreDelay.connect(convolver);
           convolver.connect(reverbWet);
           reverbWet.connect(fxSumGain);
         } catch (e) { console.warn('Reverb connect failed', e); }
         reverbWet.gain.setValueAtTime(reverbMix, audioCtx.currentTime);
       } else {
-        // disable reverb: mute wet and disconnect input to save CPU
         try { reverbWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
-        try { micSource.disconnect(reverbPreDelay); } catch(e){/* ignore */ }
+        try { dryGain.disconnect(reverbPreDelay); } catch(e){/* ignore */ }
       }
-
       openBeforeFxPopup('reverb');
     });
   }
@@ -414,17 +401,16 @@ function wireBeforeFX(){
 
       if (beforeState.delay) {
         try {
-          micSource.connect(delayNode);
+          dryGain.connect(delayNode); // Connect from dryGain, post-pitch-shift
           delayNode.connect(delayWet);
           delayWet.connect(fxSumGain);
-          delayFeedback.connect(delayNode); // ensure feedback loop present
+          delayFeedback.connect(delayNode);
         } catch(e){ console.warn('Delay connect failed', e); }
         delayWet.gain.setValueAtTime(delayMix, audioCtx.currentTime);
       } else {
         try { delayWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
-        try { micSource.disconnect(delayNode); } catch(e){}
+        try { dryGain.disconnect(delayNode); } catch(e){}
       }
-
       openBeforeFxPopup('delay');
     });
   }
@@ -435,7 +421,6 @@ function wireBeforeFX(){
       beforeFXBtns.flanger.classList.toggle('active', beforeState.flanger);
 
       if (beforeState.flanger) {
-        // create and start an oscillator for LFO each enable (clean lifecycle)
         try {
           flangerLFO = audioCtx.createOscillator();
           flangerLFO.type = 'sine';
@@ -445,7 +430,7 @@ function wireBeforeFX(){
           flangerLFO.connect(flangerDepthGain);
           flangerDepthGain.connect(flangerDelay.delayTime);
 
-          micSource.connect(flangerDelay);
+          dryGain.connect(flangerDelay); // Connect from dryGain, post-pitch-shift
           flangerDelay.connect(flangerWet);
           flangerWet.connect(fxSumGain);
           flangerDelay.connect(flangerFeedback);
@@ -456,12 +441,10 @@ function wireBeforeFX(){
         flangerWet.gain.setValueAtTime(flangerMix, audioCtx.currentTime);
       } else {
         try { flangerWet.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01); } catch {}
-        try { micSource.disconnect(flangerDelay); } catch(e){}
-        // stop and disconnect LFO
+        try { dryGain.disconnect(flangerDelay); } catch(e){}
         try { flangerLFO.stop(); flangerLFO.disconnect(); } catch (e) {}
         flangerLFO = null;
       }
-
       openBeforeFxPopup('flanger');
     });
   }
@@ -475,7 +458,12 @@ function wireBeforeFX(){
     });
   }
   if (beforeFXBtns.pitch){
-    addTap(beforeFXBtns.pitch, ()=> openBeforeFxPopup('pitch'));
+    addTap(beforeFXBtns.pitch, async ()=>{
+        await ensureMic();
+        beforeState.pitch = !beforeState.pitch; 
+        beforeFXBtns.pitch.classList.toggle('active', beforeState.pitch);
+        openBeforeFxPopup('pitch');
+    });
   }
 }
 
@@ -523,7 +511,6 @@ class Looper {
       this.disable(true);
     }
 
-    // Stop button logic (single click)
     if (this.stopBtn) {
       addTap(this.stopBtn, () => {
         if (this.state === 'playing' || this.state === 'overdub') this.stopPlayback();
@@ -532,7 +519,6 @@ class Looper {
       });
     }
 
-    // Clear button logic (single click)
     if (this.clearBtn) {
       addTap(this.clearBtn, () => this.clearLoop());
     }
@@ -547,13 +533,11 @@ class Looper {
   }
 
   async _startWorkletRecording(lenSec){
-    // set state & UI first
     this.state = 'recording';
     this.updateUI();
     this.loopBuffer = null;
     this.targetLenSec = lenSec;
 
-    // Start the visual recorder animation IMMEDIATELY (guaranteed)
     const start = audioCtx.currentTime;
     const animate = () => {
       if (this.state === 'recording'){
@@ -562,42 +546,22 @@ class Looper {
         if (pct < 1) requestAnimationFrame(animate);
       }
     };
-    // call animate before attempting worklet creation so visuals won't be blocked by JS errors
     animate();
 
-    // Try to create the AudioWorkletNode (safe, but don't block visuals if it fails)
     try {
       this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
-
-      // If any before-FX is enabled, record the processed (fxSumGain) signal so loops include before-FX.
-      // Otherwise, record dryGain (previous behavior).
-      try {
-        const shouldRecordProcessed = beforeState.reverb || beforeState.delay || beforeState.flanger || beforeState.eq5;
-        if (shouldRecordProcessed) {
-          // try to connect processed bus first
-          fxSumGain.connect(this.workletNode);
-        } else {
-          dryGain.connect(this.workletNode);
-        }
-      } catch (e) {
-        console.warn('Recorder worklet connect failed, falling back to dryGain:', e);
-        try { dryGain.connect(this.workletNode); } catch (e2) { console.error('Fallback connect failed', e2); }
-      }
-
+      
+      const sourceForRecording = (beforeState.reverb || beforeState.delay || beforeState.flanger || beforeState.eq5) ? fxSumGain : dryGain;
+      sourceForRecording.connect(this.workletNode);
+      
       this.workletNode.port.postMessage({ cmd: 'reset' });
 
-
-      // keep previous behavior: schedule stop when time's up
       setTimeout(()=> this._stopWorkletRecording(), lenSec * 1000);
     } catch (err) {
-      // Worklet failed — show a console warning and rely on visual-only fallback
       console.warn('AudioWorkletNode creation failed; running visual fallback for recording:', err);
       showMsg('⚠️ Recorder worklet failed — visual record will run, but audio capture may not work.', '#ffe066');
-      // still schedule a fallback stop so the ring completes
       setTimeout(() => {
-        // if we ever created part of the node, try to stop/cleanup
         try { if (this.workletNode) { dryGain.disconnect(this.workletNode); fxSumGain.disconnect(this.workletNode); this.workletNode.disconnect(); } } catch (e) {}
-        // move to 'playing' state so UI updates (playback won't start because there's no buffer)
         this.state = 'playing';
         this.updateUI();
       }, lenSec * 1000);
@@ -616,17 +580,12 @@ class Looper {
         const buffer = audioCtx.createBuffer(channels.length, length, sampleRate);
         channels.forEach((data, ch)=> buffer.getChannelData(ch).set(data));
 
-        // FIX: Use actual recorded length for track 1 (don't pad to original maximum)
         const sr = sampleRate;
         let targetSamples;
         if (this.index === 1) {
-          // Use the worklet-reported frames length when available (don't force the
-          // buffer to the originally requested max duration). This prevents short
-          // manual stops from being padded to the full 60s.
           const maxSamples = Math.round(this.targetLenSec * sr);
           targetSamples = Math.min(length, maxSamples);
         } else {
-          // tracks 2..4 are tied to masterLoopDuration — preserve existing behavior
           targetSamples = Math.round(masterLoopDuration * sr * this.divider);
         }
 
@@ -645,7 +604,7 @@ class Looper {
         if (this.index===1){
           masterLoopDuration=this.loopDuration;
           masterBPM = Math.round((60/this.loopDuration)*4);
-          updateDelayFromTempo(); // keep delay in sync with BPM
+          updateDelayFromTempo();
           masterIsSet=true; bpmLabel.textContent = `BPM: ${masterBPM}`;
           for (let k=2;k<=4;k++) loopers[k].disable(false);
         }
@@ -710,55 +669,55 @@ class Looper {
   }
 
   async phaseLockedRecord(){
-  if (this.index===1 || !masterIsSet){
-    await this.startRecording();
-    return;
+    if (this.index===1 || !masterIsSet){
+      await this.startRecording();
+      return;
+    }
+    this.state='waiting'; this.updateUI();
+    const now = audioCtx.currentTime, master = loopers[1];
+    const elapsed = (now - master.loopStartTime) % masterLoopDuration;
+    const toNext = masterLoopDuration - elapsed;
+    setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
   }
-  this.state='waiting'; this.updateUI();
-  const now = audioCtx.currentTime, master = loopers[1];
-  const elapsed = (now - master.loopStartTime) % masterLoopDuration;
-  const toNext = masterLoopDuration - elapsed;
-  setTimeout(()=>{ this._startPhaseLockedRecording(masterLoopDuration*this.divider); }, toNext*1000);
-}
 
-async _startPhaseLockedRecording(len){
-  this._startWorkletRecording(len);
-}
+  async _startPhaseLockedRecording(len){
+    this._startWorkletRecording(len);
+  }
 
-async startRecording(){
-  if (this.index>=2 && !masterIsSet) return;
-  const max = (this.index===1) ? 60 : (masterLoopDuration? masterLoopDuration*this.divider : 12);
-  this._startWorkletRecording(max);
-}
+  async startRecording(){
+    if (this.index>=2 && !masterIsSet) return;
+    const max = (this.index===1) ? 60 : (masterLoopDuration? masterLoopDuration*this.divider : 12);
+    this._startWorkletRecording(max);
+  }
 
-async stopRecordingAndPlay(){
-  this._stopWorkletRecording();
-}
+  async stopRecordingAndPlay(){
+    this._stopWorkletRecording();
+  }
 
-abortRecording(){
-    if (this.workletNode) {
+  abortRecording(){
+      if (this.workletNode) {
+          try {
+              this.workletNode.port.postMessage({ cmd:'reset' });
+              dryGain.disconnect(this.workletNode);
+              fxSumGain.disconnect(this.workletNode);
+              this.workletNode.disconnect();
+          } catch {}
+          this.workletNode = null;
+      }
+      if (this.mediaRecorder && this.state==='recording'){
         try {
-            this.workletNode.port.postMessage({ cmd:'reset' });
-            dryGain.disconnect(this.workletNode);
-            fxSumGain.disconnect(this.workletNode);
-            this.workletNode.disconnect();
+          this.mediaRecorder.ondataavailable = null;
+          this.mediaRecorder.onstop = null;
+          this.mediaRecorder.stop();
         } catch {}
-        this.workletNode = null;
+        this.mediaRecorder=null; this.chunks=[];
+      }
+      this.state='ready';
+      this.loopBuffer=null;
+      this.loopDuration=0;
+      this.setRing(0);
+      this.updateUI();
     }
-    if (this.mediaRecorder && this.state==='recording'){
-      try {
-        this.mediaRecorder.ondataavailable = null;
-        this.mediaRecorder.onstop = null;
-        this.mediaRecorder.stop();
-      } catch {}
-      this.mediaRecorder=null; this.chunks=[];
-    }
-    this.state='ready';
-    this.loopBuffer=null;
-    this.loopDuration=0;
-    this.setRing(0);
-    this.updateUI();
-  }
 
   _applyPitchIfAny(){
     const fxPitch = this.fx.chain.find(e=>e.type==='Pitch');
@@ -852,7 +811,7 @@ abortRecording(){
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
 
-    this._overdubAnimate(); // start overdub ring animation
+    this._overdubAnimate();
 
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
@@ -870,7 +829,7 @@ abortRecording(){
             for (let i=0;i<length;i++) outD[i]=(o?o[i]||0:0)+(n?n[i]||0:0);
           }
           this.loopBuffer=out; this.loopDuration=out.duration; this.startPlayback();
-          this._animate(); // return to playback ring animation
+          this._animate();
         });
       };
       this.mediaRecorder.stop();
@@ -1054,27 +1013,19 @@ function wireFxParams(lp, fx){
 // ======= BEFORE-FX WIRING & AUDIO UNLOCK =======
 wireBeforeFX();
 
-// The single, safer monitor button handler.
 const monitorBtn = $('#monitorBtn');
 monitorBtn.addEventListener('click', async ()=>{
   await ensureMic();
-
   liveMicMonitoring = !liveMicMonitoring;
-
-  // Smoothly ramp monitor gain for click-free change
-  // replace direct gain scheduling with safe helper
   const now = audioCtx.currentTime;
-  // use safeSetGain to ensure consistent ramping
   if (liveMicMonitorGain && typeof liveMicMonitorGain.safeSetGain === 'function') {
     liveMicMonitorGain.safeSetGain(liveMicMonitoring ? 1.0 : 0.0, now, 0.03);
   } else {
-    // fallback to direct ramp if safe helper is missing
     liveMicMonitorGain.gain.cancelScheduledValues(now);
     liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, now);
     liveMicMonitorGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
   }
 
-  // Also ramp the mic->master gate in sync with the monitor toggle
   if (micToMasterGain && micToMasterGain.gain) {
     try {
       micToMasterGain.gain.cancelScheduledValues(now);
@@ -1083,12 +1034,10 @@ monitorBtn.addEventListener('click', async ()=>{
     } catch (e) { console.warn('micToMasterGain ramp failed', e); }
   }
 
-  // If enabling monitor, force before-FX wet gains to 0 to guarantee a clean mic signal
   if (liveMicMonitoring) {
     try { if (reverbWet) reverbWet.gain.setValueAtTime(0, now); } catch {}
     try { if (delayWet) delayWet.gain.setValueAtTime(0, now); } catch {}
     try { if (flangerWet) flangerWet.gain.setValueAtTime(0, now); } catch {}
-    // Also ensure beforeState flags reflect that the user shouldn't expect FX in the monitor
     beforeState.reverb = false; beforeState.delay = false; beforeState.flanger = false;
   }
 
@@ -1096,16 +1045,10 @@ monitorBtn.addEventListener('click', async ()=>{
   monitorBtn.textContent = liveMicMonitoring ? 'Live MIC ON 🎤' : 'Live MIC OFF';
 });
 
-// ---------- Startup hint (show initial instruction) ----------
 window.addEventListener('DOMContentLoaded', () => {
-  // Show a friendly instruction so users know to press a Record button to allow microphone access
   showMsg('🎤 Click any Record button (or the top "Record Mix") to allow microphone access.', '#22ff88');
-
-  // Small visual hint under the mix record area if present
   const hintEl = document.getElementById('mixRecHint');
   if (hintEl) hintEl.textContent = 'Tip: Click Record to allow mic access and start recording.';
-
-  // Remove the hint after a short time (but leave it if user interacts)
   setTimeout(() => { try { hideMsg(); } catch (e){} }, 3500);
 });
 
@@ -1129,7 +1072,7 @@ function setMixButton(on){
 }
 
 async function startMasterRecording(){
-  await ensureMic(); // make sure masterStream exists
+  await ensureMic();
   if (!masterStream){
     showMsg('❌ Master stream not available'); return;
   }
@@ -1246,11 +1189,9 @@ async function saveMasterRecording(){
 const mixBtn = document.getElementById('mixRecBtn');
 if (mixBtn){
   addTap(mixBtn, async () => {
-    // Ensure mic is requested within the user gesture
     try {
       await ensureMic();
     } catch (e) {
-      // ensureMic already shows error messages; abort if user denied
       return;
     }
 
@@ -1272,7 +1213,6 @@ function updateDelayFromTempo() {
 
 function toggleEQ(enabled) {
     if (enabled && !eq) {
-        // Create EQ nodes and connect them
         const low = audioCtx.createBiquadFilter();
         low.type = 'lowshelf';
         low.frequency.value = 250;
@@ -1289,20 +1229,19 @@ function toggleEQ(enabled) {
         high.frequency.value = 4000;
         high.gain.value = eqHighGain;
 
-        // Disconnect direct path and insert EQ
-        try { micSource.disconnect(dryGain); } catch(e){}
-        micSource.connect(low);
+        try { dryGain.disconnect(fxSumGain); } catch(e){} // Disconnect the source from its original destination if needed
+        dryGain.connect(low);
         low.connect(mid);
         mid.connect(high);
-        high.connect(dryGain);
+        high.connect(fxSumGain);
 
         eq = { low, mid, high, connected: true };
 
     } else if (!enabled && eq && eq.connected) {
-        // Disconnect EQ and restore direct path
-        try { micSource.disconnect(eq.low); } catch(e){}
-        try { eq.high.disconnect(dryGain); } catch(e){}
-        micSource.connect(dryGain);
+        try { dryGain.disconnect(eq.low); } catch(e){}
+        try { eq.high.disconnect(fxSumGain); } catch(e){}
+        dryGain.connect(fxSumGain);
         eq.connected = false;
     }
 }
+
