@@ -77,6 +77,8 @@ const beforeState = { delay:false, reverb:false, flanger:false, eq5:false };
 
 // Live monitor
 let liveMicMonitorGain = null, liveMicMonitoring = false;
+// Gate that controls whether mic is allowed into the master mix (keeps mic silent until user enables)
+let micToMasterGain = null;
 
 // Master timing from track 1
 let masterLoopDuration = null, masterBPM = null, masterIsSet = false;
@@ -193,8 +195,15 @@ async function ensureMic(){
   masterBus = audioCtx.createGain();
   masterBus.gain.value = 1;
 
-  // route dry and FX into the master mix so Before-FX is audible in the final output
-  dryGain.connect(masterBus);
+  // create mic->master gate and keep it muted by default
+  micToMasterGain = audioCtx.createGain();
+  micToMasterGain.gain.value = 0; // safety: don't route mic to master until user explicitly enables
+
+  // route dry into the gate, then into masterBus (so we can open/close mic->master without changing other wiring)
+  dryGain.connect(micToMasterGain);
+  micToMasterGain.connect(masterBus);
+
+  // keep FX summed into master as before
   fxSumGain.connect(masterBus);
 
   masterBus.connect(audioCtx.destination); // For listening
@@ -990,6 +999,15 @@ monitorBtn.addEventListener('click', async ()=>{
     liveMicMonitorGain.gain.cancelScheduledValues(now);
     liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, now);
     liveMicMonitorGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
+  }
+
+  // Also ramp the mic->master gate in sync with the monitor toggle
+  if (micToMasterGain && micToMasterGain.gain) {
+    try {
+      micToMasterGain.gain.cancelScheduledValues(now);
+      micToMasterGain.gain.setValueAtTime(micToMasterGain.gain.value, now);
+      micToMasterGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
+    } catch (e) { console.warn('micToMasterGain ramp failed', e); }
   }
 
   // If enabling monitor, force before-FX wet gains to 0 to guarantee a clean mic signal
