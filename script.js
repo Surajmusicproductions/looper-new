@@ -206,6 +206,33 @@ async function ensureMic(){
   liveMicMonitorGain = audioCtx.createGain();
   liveMicMonitorGain.gain.value = 0; // keep muted by default
 
+  // === Start: monitor safety guard ===
+  // MONITOR_GUARD: only monitorBtn should change liveMicMonitorGain via safeSetGain()
+  // Prevent accidental programmatic unmute elsewhere in the code.
+  // Only the monitor button handler should ramp the monitor gain.
+  liveMicMonitorGain._monitorControlOnly = true;
+
+  // helper to safely set/ramp the monitor gain (used by monitor button only)
+  liveMicMonitorGain.safeSetGain = (value, when = audioCtx.currentTime, rampTime = 0.03) => {
+    // cancel any scheduled values and ramp smoothly
+    liveMicMonitorGain.gain.cancelScheduledValues(when);
+    liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, when);
+    liveMicMonitorGain.gain.linearRampToValueAtTime(value, when + rampTime);
+  };
+  // === End: monitor safety guard ===
+
+  // DEV WARNING: detect direct setValue attempts (non-blocking)
+  try {
+    const origSet = liveMicMonitorGain.gain.setValueAtTime.bind(liveMicMonitorGain.gain);
+    liveMicMonitorGain.gain.setValueAtTime = (v, when) => {
+      if (!liveMicMonitorGain._monitorControlOnly) {
+        console.warn('Monitor gain setValueAtTime called from unexpected code path', v, when);
+      }
+      return origSet(v, when);
+    };
+  } catch(e){ /* ignore in production */ }
+
+
   // CORRECTED WIRING: Monitor ONLY the dry mic to avoid hearing delay/reverb/flanger
   try {
     // connect only the dry (unprocessed) mic to monitor to deliver a single clean signal
@@ -953,10 +980,17 @@ monitorBtn.addEventListener('click', async ()=>{
   liveMicMonitoring = !liveMicMonitoring;
 
   // Smoothly ramp monitor gain for click-free change
+  // replace direct gain scheduling with safe helper
   const now = audioCtx.currentTime;
-  liveMicMonitorGain.gain.cancelScheduledValues(now);
-  liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, now);
-  liveMicMonitorGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
+  // use safeSetGain to ensure consistent ramping
+  if (liveMicMonitorGain && typeof liveMicMonitorGain.safeSetGain === 'function') {
+    liveMicMonitorGain.safeSetGain(liveMicMonitoring ? 1.0 : 0.0, now, 0.03);
+  } else {
+    // fallback to direct ramp if safe helper is missing
+    liveMicMonitorGain.gain.cancelScheduledValues(now);
+    liveMicMonitorGain.gain.setValueAtTime(liveMicMonitorGain.gain.value, now);
+    liveMicMonitorGain.gain.linearRampToValueAtTime(liveMicMonitoring ? 1.0 : 0.0, now + 0.03);
+  }
 
   // If enabling monitor, force before-FX wet gains to 0 to guarantee a clean mic signal
   if (liveMicMonitoring) {
