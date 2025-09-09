@@ -192,6 +192,11 @@ async function ensureMic(){
   // MASTER BUS (final mix for export)
   masterBus = audioCtx.createGain();
   masterBus.gain.value = 1;
+
+  // route dry and FX into the master mix so Before-FX is audible in the final output
+  dryGain.connect(masterBus);
+  fxSumGain.connect(masterBus);
+
   masterBus.connect(audioCtx.destination); // For listening
   masterDest = audioCtx.createMediaStreamDestination(); // For recording
   masterBus.connect(masterDest);
