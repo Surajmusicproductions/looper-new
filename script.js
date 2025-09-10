@@ -204,7 +204,7 @@ async function ensureMic(){
   micToMasterGain.connect(masterBus);
 
   // keep FX summed into master as before
-  fxSumGain.connect(masterBus);
+  fxSumGain.connect(micToMasterGain);
 
   masterBus.connect(audioCtx.destination); // For listening
   masterDest = audioCtx.createMediaStreamDestination(); // For recording
