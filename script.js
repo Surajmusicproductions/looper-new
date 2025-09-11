@@ -5,6 +5,7 @@
    - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
    Patched based on user feedback to fix live monitor echo and consolidate code.
+   Pro-Timing Update: 2025-09-11 - Replaced MediaRecorder overdub with sample-accurate AudioWorklet mixing.
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -13,6 +14,8 @@ let audioCtx = new (window.AudioContext || window.webkitAudioContext)({
   latencyHint: _isMobile ? 'playback' : 'interactive'
 });
 
+// Global setting for mic features, controllable by the user.
+let useEchoCancellation = true;
 
 // Recommend serving via localhost/https — file:// will usually fail for Worklets
 if (window.location.protocol === 'file:') {
@@ -55,10 +58,10 @@ if (window.location.protocol === 'file:') {
 let micStream = null, micSource = null;
 
 // ======= GLOBAL (Before-FX) GRAPH =======
-let dryGain, fxSumGain, mixDest, processedStream, recorderSum, recorderTapGain;
+let dryGain, fxSumGain, mixDest, processedStream, recorderSum;
 
 // Reverb (Before)
-let convolver, reverbPreDelay, reverbWet, reverbLowpass;
+let convolver, reverbPreDelay, reverbWet;
 // wiring guards to avoid duplicate connects
 let _reverbWired = false;
 let _delayWired = false;
@@ -127,38 +130,28 @@ function addHold(btn, onStart, onEnd){
 function clamp(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
 function debounce(fn, ms=130){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 
-// Reverb IR — improved: lower hiss, fade-in, gentle low-frequency roll-off
+// Reverb IR (exponential decay for a more audible tail)
 function makeReverbImpulse(seconds, decay){
   const sr = audioCtx.sampleRate;
   const len = Math.max(1, Math.floor(sr * seconds));
   const buf = audioCtx.createBuffer(2, len, sr);
 
+  // stronger exponential decay rather than linear (more natural and audible)
+  // 'decay' controls tail length; scale factor 3 gives reasonable energy.
   const scale = Math.max(0.001, decay);
-  const fadeInSamples = Math.max(1, Math.floor(sr * 0.005)); // 5 ms fade-in
-
   for (let ch = 0; ch < 2; ch++){
     const d = buf.getChannelData(ch);
-    // previous sample for simple 1st-order smoothing
-    let prev = 0;
     for (let i = 0; i < len; i++){
+      // time in seconds into the IR
       const t = i / sr;
-      // reduced amplitude white noise
-      let n = (Math.random() * 2 - 1) * 0.22; // reduce base noise amplitude
-      // exponential envelope
+      // exponential envelope: exp(-alpha * t)
+      // alpha tuned to seconds & decay to produce perceptible tail
       const alpha = 3.0 / Math.max(0.001, seconds) * scale;
-      n *= Math.exp(-alpha * t);
-      // short fade-in to avoid clicks
-      const fadeIn = (i < fadeInSamples) ? (i / fadeInSamples) : 1;
-      // gentle highpass-like attenuation of very low freqs (more natural)
-      const hp = 0.6 + 0.4 * (t / Math.max(0.001, seconds));
-      let sample = n * fadeIn * hp;
-      // smooth with previous sample to remove harsh HF
-      sample = 0.5 * (sample + prev);
-      d[i] = sample;
-      prev = sample;
+      // white noise * exp decay
+      d[i] = (Math.random() * 2 - 1) * Math.exp(-alpha * t);
+      // small low-pass smoothing to avoid harsh high-frequency noise
+      if (i > 0) d[i] = 0.5 * (d[i] + d[i - 1]);
     }
-    // ensure first sample is zero
-    d[0] = 0;
   }
   return buf;
 }
@@ -170,7 +163,17 @@ function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ?
 
 // ======= AUDIO SETUP =======
 async function ensureMic(){
-  if (micStream) return;
+  // If stream exists and settings are unchanged, do nothing.
+  if (micStream) {
+    const settings = micStream.getAudioTracks()[0]?.getSettings();
+    if (settings && settings.echoCancellation === useEchoCancellation) {
+        return;
+    }
+    // Settings have changed, so stop the old stream before creating a new one.
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+
   if (audioCtx.state === 'suspended') {
     try { await audioCtx.resume(); } catch {}
   }
@@ -179,8 +182,8 @@ async function ensureMic(){
     // Use browser echo cancellation & noise suppression for cleaner live monitoring tests.
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
+        echoCancellation: useEchoCancellation,
+        noiseSuppression: useEchoCancellation, // Also toggle noise suppression for consistency
         autoGainControl: false
       }
     });
@@ -194,14 +197,10 @@ async function ensureMic(){
   // --- Reverb path ---
   reverbPreDelay = audioCtx.createDelay(1.0); reverbPreDelay.delayTime.value = reverbPreDelayMs/1000;
   convolver = audioCtx.createConvolver();
-  convolver.normalize = true; // normalize IR energy -> avoids unexpected hiss/peaks
+  convolver.normalize = false; // keep energy as generated by our IR
   convolver.buffer = makeReverbImpulse(reverbRoomSeconds, reverbDecay);
   reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0; // CORRECT: Start wet gain at 0
-  // Add a gentle lowpass to tame HF hiss from the synthetic IR
-  reverbLowpass = audioCtx.createBiquadFilter();
-  reverbLowpass.type = 'lowpass';
-  reverbLowpass.frequency.value = 12000;
-  convolver._lowpass = reverbLowpass; // Store for later tweaking if needed
+  // Note: connection happens on-demand in wireBeforeFX
 
   // --- Delay path ---
   delayNode = audioCtx.createDelay(2.0);
@@ -225,20 +224,16 @@ async function ensureMic(){
   mixDest = audioCtx.createMediaStreamDestination();
 
   // Create a stable summing node that always receives both dry and processed signal.
+  // Recorder / overdub must read from this summing node so toggling before-FX mid-record is audible.
   recorderSum = audioCtx.createGain();
   recorderSum.gain.value = 1.0;
-
-  // Tap point for sample-accurate recording, controlled by gain scheduling
-  recorderTapGain = audioCtx.createGain();
-  recorderTapGain.gain.value = 0; // Muted by default
-  recorderSum.connect(recorderTapGain);
 
   // route dry + fx into the recorder sum
   dryGain.connect(recorderSum);
   fxSumGain.connect(recorderSum);
 
   // recorder and overdub MediaStreamDestination read from recorderSum
-  recorderTapGain.connect(mixDest); // Route tap to stream destination
+  recorderSum.connect(mixDest);
   processedStream = mixDest.stream;
 
 
@@ -309,6 +304,7 @@ async function ensureMic(){
 
 
   hideMsg();
+  updateLatencyDisplay();
 }
 
 // ======= BEFORE-FX BUTTONS + POPUP =======
@@ -446,8 +442,7 @@ function wireBeforeFX(){
           if (!_reverbWired) {
             micSource.connect(reverbPreDelay);
             reverbPreDelay.connect(convolver);
-            convolver.connect(reverbLowpass);
-            reverbLowpass.connect(reverbWet);
+            convolver.connect(reverbWet);
             reverbWet.connect(fxSumGain);
             _reverbWired = true;
           }
@@ -653,20 +648,28 @@ class Looper {
       this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
       this._connectedToRecorderSum = false;
 
-      // Connect through the schedulable recorderTapGain for consistency
-      if (typeof recorderTapGain !== 'undefined' && recorderTapGain) {
-          recorderTapGain.connect(this.workletNode);
-          this._connectedToRecorderSum = true; // Still using this flag for cleanup logic
-          // Schedule tap gain to be open for recording
-          const now = audioCtx.currentTime;
-          recorderTapGain.gain.cancelScheduledValues(now);
-          recorderTapGain.gain.setValueAtTime(1, now);
-      } else if (typeof recorderSum !== 'undefined' && recorderSum) {
-          // fallback: direct connection if tap gain is missing
-          recorderSum.connect(this.workletNode);
-          this._connectedToRecorderSum = true;
+      // Always connect the worklet to the stable recorderSum so toggling Before-FX mid-record works.
+      try {
+        if (!isRecorderSumConnectedToWorklet.get(this.workletNode)) {
+            // recorderSum is our stable summing node of dry + fx
+            if (typeof recorderSum === 'undefined' || recorderSum === null) {
+              // defensive fallback: create and wire a local sum if ensureMic wasn't run (shouldn't happen)
+              const _recSum = audioCtx.createGain();
+              dryGain.connect(_recSum);
+              fxSumGain.connect(_recSum);
+              this._recorderSumLocal = _recSum; // store for cleanup later
+              _recSum.connect(this.workletNode);
+              this._connectedToRecorderSum = '_local';
+            } else {
+              recorderSum.connect(this.workletNode);
+              this._connectedToRecorderSum = true;
+            }
+            isRecorderSumConnectedToWorklet.set(this.workletNode, true);
+        }
+      } catch (e) {
+        console.warn('Recorder worklet connect failed to recorderSum, falling back to dryGain:', e);
+        try { dryGain.connect(this.workletNode); } catch (e2) { console.error('Fallback connect failed', e2); }
       }
-
 
       this.workletNode.port.postMessage({ cmd: 'reset' });
 
@@ -689,14 +692,6 @@ class Looper {
 
   async _stopWorkletRecording(){
     if (!this.workletNode) return;
-
-    // Mute the tap gain for main recording
-    if (typeof recorderTapGain !== 'undefined' && recorderTapGain) {
-      const now = audioCtx.currentTime;
-      recorderTapGain.gain.cancelScheduledValues(now);
-      recorderTapGain.gain.setValueAtTime(0, now);
-    }
-
     this.state='playing'; this.updateUI();
 
     const node = this.workletNode;
@@ -746,11 +741,20 @@ class Looper {
     node.port.postMessage({ cmd:'dump' });
 
     try {
-        if (this._connectedToRecorderSum) {
-            if (recorderTapGain) recorderTapGain.disconnect(node);
-            else if (recorderSum) recorderSum.disconnect(node);
-        }
+      if (this._connectedToRecorderSum === '_local' && this._recorderSumLocal) {
+        // local temporary sum: disconnect it and free it
+        try { this._recorderSumLocal.disconnect(node); } catch(e){}
+        try { dryGain.disconnect(this._recorderSumLocal); } catch(e){}
+        try { fxSumGain.disconnect(this._recorderSumLocal); } catch(e){}
+        this._recorderSumLocal = null;
+      } else {
+        try { if (typeof recorderSum !== 'undefined' && recorderSum) recorderSum.disconnect(node); } catch(e){}
+      }
     } catch(e){ /* ignore */ }
+
+    // also attempt to remove any direct dry/fx connects if they were applied as fallback
+    try { dryGain.disconnect(node); } catch(e){}
+    try { fxSumGain.disconnect(node); } catch(e){}
 
     try { node.disconnect(); } catch(e){}
     this.workletNode = null;
@@ -803,7 +807,7 @@ class Looper {
     if (this.state==='ready') await this.phaseLockedRecord();
     else if (this.state==='recording') await this.stopRecordingAndPlay();
     else if (this.state==='playing') this.armOverdub();
-    else if (this.state==='overdub') {} // Overdub now finishes automatically
+    else if (this.state==='overdub') this._stopOverdubWorklet(); // Manually stop overdub with new worklet logic
   }
 
   async phaseLockedRecord(){
@@ -836,11 +840,19 @@ abortRecording(){
     if (this.workletNode) {
         try {
             this.workletNode.port.postMessage({ cmd:'reset' });
-            if (recorderTapGain) recorderTapGain.disconnect(this.workletNode);
-            else if (recorderSum) recorderSum.disconnect(this.workletNode);
+            dryGain.disconnect(this.workletNode);
+            fxSumGain.disconnect(this.workletNode);
             this.workletNode.disconnect();
         } catch {}
         this.workletNode = null;
+    }
+    if (this.mediaRecorder && this.state==='recording'){
+      try {
+        this.mediaRecorder.ondataavailable = null;
+        this.mediaRecorder.onstop = null;
+        this.mediaRecorder.stop();
+      } catch {}
+      this.mediaRecorder=null; this.chunks=[];
     }
     this.state='ready';
     this.loopBuffer=null;
@@ -912,12 +924,9 @@ abortRecording(){
       const master = loopers[1]; const now = audioCtx.currentTime - master.loopStartTime;
       off = now % masterLoopDuration; if (isNaN(off)||off<0||off>this.loopBuffer.duration) off=0;
     }
-    
-    const startTime = audioCtx.currentTime + 0.005;
-    try { this.sourceNode.start(startTime, off); } catch { try { this.sourceNode.start(0, off); } catch {} }
-    this.loopStartTime = startTime - off;
-
+    this.loopStartTime = audioCtx.currentTime - off;
     this._rebuildChainWiring();
+    try{ this.sourceNode.start(0, off); }catch{ try{ this.sourceNode.start(0,0); }catch{} }
     this.state='playing'; this.updateUI(); this._animate();
     renderTrackFxSummary(this.index);
   }
@@ -933,117 +942,179 @@ abortRecording(){
 
   armOverdub(){
     if (this.state!=='playing') return;
-    // schedule overdub to start exactly on next loop boundary
-    this.state = 'overdub'; this.updateUI();
-    const now = audioCtx.currentTime;
-    // elapsed into this loop
-    const elapsed = (now - this.loopStartTime) % this.loopDuration;
-    const toNext = this.loopDuration - elapsed;
-    // schedule start precisely at audio time
-    setTimeout(()=> this.startOverdubRecording(), Math.max(0, toNext*1000));
+    this.state='overdub'; this.updateUI();
+    const now=audioCtx.currentTime; const elapsed=(now-this.loopStartTime)%this.loopDuration;
+    setTimeout(()=>this.startOverdubRecording(), (this.loopDuration - elapsed)*1000);
   }
 
+  // ---------- Overdub: worklet-based (replaces old MediaRecorder method) ----------
   startOverdubRecording(){
-    this.overdubStartTime = audioCtx.currentTime; // for animation timing
+    // start sample-accurate overdub using the recorder worklet
+    this.overdubStartTime = audioCtx.currentTime;
     this.state = 'overdub';
     this.updateUI();
     this._overdubAnimate();
 
+    // create / attach worklet recorder
     try {
-        this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
-        
-        if (!recorderTapGain) {
-            console.warn('recorderTapGain not found, overdub may fail.');
-            this.state = 'playing'; this.updateUI(); return;
+      this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
+      // connect stable recorderSum -> overdub worklet (same pattern as _startWorkletRecording)
+      try {
+        if (!isRecorderSumConnectedToWorklet.get(this.overdubWorklet)) {
+          recorderSum.connect(this.overdubWorklet);
+          isRecorderSumConnectedToWorklet.set(this.overdubWorklet, true);
         }
+      } catch(e){
+        // best-effort fallback: connect dryGain if recorderSum isn't available
+        console.warn('Overdub worklet connect to recorderSum failed, falling back to dryGain:', e);
+        try { dryGain.connect(this.overdubWorklet); } catch(e2){ console.error('Fallback connect failed', e2); }
+      }
 
-        recorderTapGain.connect(this.overdubWorklet);
-        this._connectedToTap = true;
+      this.overdubWorklet.port.postMessage({ cmd: 'reset' });
 
-        this.overdubWorklet.port.onmessage = (e) => this.finishOverdub(e);
-        this.overdubWorklet.port.postMessage({ cmd: 'reset' });
+      // schedule stop exactly one loop later (sample-accurate capture regardless of UI thread)
+      this._overdubStopTimeout = setTimeout(()=> this._stopOverdubWorklet(), this.loopDuration * 1000);
 
-        const now = audioCtx.currentTime;
-        const scheduledStart = now;
-        const scheduledStop = scheduledStart + this.loopDuration;
-
-        recorderTapGain.gain.cancelScheduledValues(now);
-        recorderTapGain.gain.setValueAtTime(0, scheduledStart);
-        recorderTapGain.gain.linearRampToValueAtTime(1, scheduledStart + 0.002);
-        recorderTapGain.gain.setValueAtTime(1, scheduledStop);
-        recorderTapGain.gain.linearRampToValueAtTime(0, scheduledStop + 0.002);
-
-        setTimeout(() => {
-            if (this.overdubWorklet) {
-                this.overdubWorklet.port.postMessage({ cmd: 'dump' });
-            }
-        }, (this.loopDuration * 1000) + 50);
-
-    } catch (e) {
-        console.error('Failed to start sample-accurate overdub:', e);
+    } catch (err) {
+      // Worklet creation failed — fallback to existing MediaRecorder approach (less accurate)
+      console.warn('Overdub worklet creation failed — falling back to MediaRecorder (less accurate):', err);
+      // existing MediaRecorder path (kept for fallback compatibility)
+      this.overdubChunks = [];
+      try {
+        this.mediaRecorder = new MediaRecorder(processedStream);
+        this.mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) this.overdubChunks.push(e.data); };
+        this.mediaRecorder.start();
+        this._overdubStopTimeout = setTimeout(()=> this.finishOverdub(), this.loopDuration * 1000);
+      } catch (e) {
+        console.error('MediaRecorder fallback failed too', e);
+        // clean up state
         this.state = 'playing';
         this.updateUI();
+      }
     }
   }
 
-  async finishOverdub(e){
-    if (!e.data || e.data.cmd !== 'dump') return;
+  async _stopOverdubWorklet(){
+    if (this._overdubStopTimeout){ clearTimeout(this._overdubStopTimeout); this._overdubStopTimeout = null; }
 
-    const node = this.overdubWorklet;
-    if (!node) return;
+    // If we were using the overdubWorklet path, request dump
+    if (this.overdubWorklet){
+      const node = this.overdubWorklet;
+      node.port.onmessage = async (e) => {
+        if (e.data?.cmd === 'dump'){
+          const { channels, length, sampleRate } = e.data;
+          if (!length || !channels || !channels.length) {
+            // nothing recorded
+            try { recorderSum.disconnect(node); } catch {}
+            try { node.disconnect(); } catch {}
+            this.overdubWorklet = null;
+            this.state='playing'; this.updateUI();
+            return;
+          }
 
-    try {
-        const dumpData = e.data;
-        if (!dumpData || dumpData.length === 0) {
-            this.state = 'playing';
+          // create an AudioBuffer from transferred Float32Arrays
+          const recBuf = audioCtx.createBuffer(channels.length, length, sampleRate);
+          channels.forEach((arr, ch) => recBuf.getChannelData(ch).set(arr));
+
+          // ensure sampleRate matches loopBuffer; resample if needed
+          let workBuf = recBuf;
+          if (this.loopBuffer && this.loopBuffer.sampleRate !== recBuf.sampleRate) {
+            // resample to loopBuffer.sampleRate using OfflineAudioContext
+            const targetSR = this.loopBuffer.sampleRate;
+            const offline = new OfflineAudioContext(recBuf.numberOfChannels, Math.ceil(recBuf.duration * targetSR), targetSR);
+            const src = offline.createBufferSource();
+            src.buffer = recBuf;
+            src.connect(offline.destination);
+            src.start(0);
+            workBuf = await offline.startRendering();
+          }
+
+          // MIX: circular (wrap) additive mixing into this.loopBuffer (sample-accurate)
+          if (!this.loopBuffer){
+            // if no existing loop buffer, adopt the overdub as the loop
+            this.loopBuffer = workBuf;
+            this.loopDuration = workBuf.duration;
+            this.startPlayback();
+          } else {
+            const loopSR = this.loopBuffer.sampleRate;
+            if (workBuf.sampleRate !== loopSR) {
+              // Should be handled above, but double-check
+              console.warn('sampleRate mismatch while mixing overdub — skipping overdub');
+            } else {
+              const outCh = Math.max(this.loopBuffer.numberOfChannels, workBuf.numberOfChannels);
+              const loopLen = this.loopBuffer.length;
+              // mix into existing loopBuffer in-place (create new buffer to avoid changing source while playing)
+              const mixed = audioCtx.createBuffer(outCh, loopLen, loopSR);
+
+              // copy existing loop into mixed
+              for (let ch = 0; ch < outCh; ch++){
+                const mixd = mixed.getChannelData(ch);
+                const srcLoop = ch < this.loopBuffer.numberOfChannels ? this.loopBuffer.getChannelData(ch) : new Float32Array(loopLen);
+                mixd.set(srcLoop);
+              }
+
+              // add overdub samples starting at loop index 0 (overdubStartTime is scheduled to align with loop boundary)
+              // if overdub is longer than loop, wrap-around (circular)
+              for (let ch = 0; ch < workBuf.numberOfChannels; ch++){
+                const od = workBuf.getChannelData(ch);
+                for (let i = 0; i < od.length; i++){
+                  const idx = i % loopLen;
+                  mixed.getChannelData(ch)[idx] += od[i];
+                }
+              }
+
+              // replace loopBuffer
+              this.loopBuffer = mixed;
+              this.loopDuration = mixed.duration;
+              // restart playback with same loopStartTime so phase remains consistent
+              this.startPlayback();
+            }
+          }
+
+          // cleanup connections
+          try { recorderSum.disconnect(node); } catch(e){}
+          try { node.disconnect(); } catch(e){}
+          this.overdubWorklet = null;
+          this.state='playing'; this.updateUI();
+        }
+      };
+
+      // Ask worklet to send its recorded data
+      node.port.postMessage({ cmd: 'dump' });
+
+    } else if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+      // Fallback branch: use existing MediaRecorder finishOverdub flow
+      this.finishOverdub();
+    } else {
+      this.state='playing'; this.updateUI();
+    }
+  }
+
+  // This is the old MediaRecorder-based method, kept as a fallback if the worklet fails.
+  finishOverdub(){
+    if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
+      this.mediaRecorder.onstop = async ()=>{
+        if (this.overdubChunks.length === 0) {
+            this.state='playing';
             this.updateUI();
+            this._animate();
             return;
         }
-
-        const sr = dumpData.sampleRate || audioCtx.sampleRate;
-        const newBuf = audioCtx.createBuffer(dumpData.channels.length, dumpData.length, sr);
-        dumpData.channels.forEach((chData, ch) => newBuf.getChannelData(ch).set(chData));
-
-        const oC = this.loopBuffer.numberOfChannels, nC = newBuf.numberOfChannels;
-        const outC = Math.max(oC, nC);
-        const lengthSamples = Math.max(this.loopBuffer.length, newBuf.length);
-        const out = audioCtx.createBuffer(outC, lengthSamples, this.loopBuffer.sampleRate);
-        
-        // Use a 50ms crossfade to prevent clicks at the loop seam
-        const crossfadeSamples = Math.floor(sr * 0.05);
-
-        for (let ch = 0; ch < outC; ch++) {
-            const outD = out.getChannelData(ch);
-            const oD = oC > ch ? this.loopBuffer.getChannelData(ch) : null;
-            const nD = nC > ch ? newBuf.getChannelData(ch) : null;
-            for (let i = 0; i < lengthSamples; i++) {
-                const a = oD ? (oD[i] || 0) : 0;
-                const b = nD ? (nD[i] || 0) : 0;
-                
-                let fade = 1.0;
-                if (i > lengthSamples - crossfadeSamples && lengthSamples > crossfadeSamples) {
-                    fade = (lengthSamples - i) / crossfadeSamples;
-                }
-                outD[i] = a + (b * fade);
-            }
-        }
-
-        this.loopBuffer = out;
-        this.loopDuration = out.duration;
-        this.startPlayback();
-
-    } catch (err) {
-        console.warn('Overdub processing error:', err);
-        this.state = 'playing';
-        this.updateUI();
-    } finally {
-        if (this._connectedToTap && recorderTapGain) {
-            try { recorderTapGain.disconnect(node); } catch(err) {}
-        }
-        try { node.disconnect(); } catch (err) {}
-        this.overdubWorklet = null;
-        this._connectedToTap = false;
-    }
+        const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
+        audioCtx.decodeAudioData(arr, newBuf=>{
+          const oC=this.loopBuffer.numberOfChannels, nC=newBuf.numberOfChannels;
+          const outC=Math.max(oC,nC), length=Math.max(this.loopBuffer.length,newBuf.length);
+          const out=audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
+          for (let ch=0; ch<outC; ch++){
+            const outD=out.getChannelData(ch), o=oC>ch?this.loopBuffer.getChannelData(ch):null, n=nC>ch?newBuf.getChannelData(ch):null;
+            for (let i=0;i<length;i++) outD[i]=(o?o[i]||0:0)+(n?n[i]||0:0);
+          }
+          this.loopBuffer=out; this.loopDuration=out.duration; this.startPlayback();
+          this._animate(); // return to playback ring animation
+        });
+      };
+      this.mediaRecorder.stop();
+    } else { this.state='playing'; this.updateUI(); }
   }
 
   clearLoop(){
@@ -1265,10 +1336,75 @@ monitorBtn.addEventListener('click', async ()=>{
   monitorBtn.textContent = liveMicMonitoring ? 'Live MIC ON 🎤' : 'Live MIC OFF';
 });
 
-// ---------- Startup hint (show initial instruction) ----------
+function updateLatencyDisplay() {
+    const latencyDisplay = document.getElementById('latencyDisplay');
+    if (!latencyDisplay || !audioCtx || typeof audioCtx.baseLatency !== 'number') return;
+    const baseMs = (audioCtx.baseLatency * 1000).toFixed(2);
+    const outputMs = (audioCtx.outputLatency * 1000).toFixed(2);
+    latencyDisplay.textContent = `Latency: base=${baseMs}ms output=${outputMs}ms`;
+}
+
+// ---------- Startup hint & Diagnostic UI ----------
 window.addEventListener('DOMContentLoaded', () => {
   // Show a friendly instruction so users know to press a Record button to allow microphone access
   showMsg('🎤 Click any Record button (or the top "Record Mix") to allow microphone access.', '#22ff88');
+
+  // --- Create and append diagnostic tools ---
+  const diagContainer = document.createElement('div');
+  Object.assign(diagContainer.style, {
+    position: 'fixed',
+    bottom: '8px',
+    right: '8px',
+    zIndex: '1001',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+    gap: '8px'
+  });
+  document.body.appendChild(diagContainer);
+
+  // Latency Display
+  const latencyDisplay = document.createElement('div');
+  latencyDisplay.id = 'latencyDisplay';
+  Object.assign(latencyDisplay.style, {
+      background: 'rgba(0,0,0,0.6)',
+      color: '#fff',
+      padding: '4px 8px',
+      borderRadius: '4px',
+      fontSize: '11px',
+      fontFamily: 'monospace',
+      textAlign: 'right'
+  });
+  latencyDisplay.textContent = 'Latency: ...';
+  diagContainer.appendChild(latencyDisplay);
+  setInterval(updateLatencyDisplay, 2500); // Periodically update latency info
+
+  // Echo Cancellation Toggle Button
+  const echoCancelBtn = document.createElement('button');
+  echoCancelBtn.id = 'echoCancelBtn';
+  echoCancelBtn.textContent = 'Echo Cancellation: ON';
+  echoCancelBtn.classList.add('active'); // for styling
+  Object.assign(echoCancelBtn.style, {
+      padding: '5px 10px',
+      border: '1px solid #888',
+      background: '#555',
+      color: 'white',
+      borderRadius: '5px',
+      cursor: 'pointer'
+  });
+   echoCancelBtn.addEventListener('click', () => {
+    useEchoCancellation = !useEchoCancellation;
+    echoCancelBtn.textContent = `Echo Cancellation: ${useEchoCancellation ? 'ON' : 'OFF'}`;
+    echoCancelBtn.style.background = useEchoCancellation ? '#555' : '#a55';
+    showMsg('🎤 Mic setting changed. The new setting will be applied on the next recording.', '#22ff88');
+    // Force mic re-initialization on next ensureMic() call
+    if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+        micStream = null;
+        micSource = null;
+    }
+  });
+  diagContainer.appendChild(echoCancelBtn);
 
   // Small visual hint under the mix record area if present
   const hintEl = document.getElementById('mixRecHint');
@@ -1475,4 +1611,3 @@ function toggleEQ(enabled) {
         eq.connected = false;
     }
 }
-
