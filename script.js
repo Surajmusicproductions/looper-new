@@ -5,7 +5,7 @@
    - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
    Patched based on user feedback to fix live monitor echo and consolidate code.
-   Overdub path updated to use sample-accurate AudioWorklet capture.
+   Patched for Sample-Accurate Overdubbing: 2025-09-11
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -48,7 +48,7 @@ if (window.location.protocol === 'file:') {
     showMsg(`❌ Could not load audio recorder component:<br><small>${detail}</small>`, '#ff4444');
 
     // Extra console hints for debugging common causes
-    console.warn('Check: 1) Are you serving the page over http://localhost or https? 2) Is recorder-processor.js reachable (Network tab)? 3) Is there a syntax error inside recorder-processor.js? 4) Is the browser up-to-date and supports AudioWorklet?');
+    console.warn('Check: 1) Are you serving the page over http://localhost or https? 2) Is recorder-processor.js reachable (Network tab)? 3) Is MIME type application/javascript? 4) Is there a syntax error inside recorder-processor.js? 5) Is the browser up-to-date and supports AudioWorklet?');
   }
 })();
 
@@ -57,7 +57,7 @@ let micStream = null, micSource = null;
 
 // ======= GLOBAL (Before-FX) GRAPH =======
 let dryGain, fxSumGain, mixDest, processedStream, recorderSum;
-const isRecorderSumConnectedToWorklet = new WeakMap();
+let isRecorderSumConnectedToWorklet = new WeakMap(); // Bookkeeping for worklet connections
 
 
 // Reverb (Before)
@@ -142,21 +142,21 @@ function quarterSecForBPM(bpm){ return 60/(bpm||120); }
 function applyVariant(mult, v){ return v==='dotted' ? mult*1.5 : v==='triplet' ? mult*(2/3) : mult; }
 
 // ======= AUDIO SETUP =======
-async function ensureMic(proMode = false){
+async function ensureMic(){
   if (micStream) return;
   if (audioCtx.state === 'suspended') {
     try { await audioCtx.resume(); } catch {}
   }
   if (!navigator.mediaDevices?.getUserMedia) { showMsg('❌ Microphone not supported'); throw new Error('gUM'); }
   try {
+    // Use browser echo cancellation & noise suppression for cleaner live monitoring tests.
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: proMode ? false : true,
-        noiseSuppression: proMode ? false : true,
+        echoCancellation: true,
+        noiseSuppression: true,
         autoGainControl: false
       }
     });
-    console.log('audioCtx.sampleRate', audioCtx.sampleRate, 'baseLatency', audioCtx.baseLatency, 'outputLatency', audioCtx.outputLatency);
   } catch(e){ showMsg('❌ Microphone access denied'); throw e; }
 
   micSource = audioCtx.createMediaStreamSource(micStream);
@@ -188,27 +188,25 @@ async function ensureMic(proMode = false){
 
   micSource.connect(dryGain);
 
-  // Recording stream (for overdubs)
-  mixDest = audioCtx.createMediaStreamDestination();
-  // create a single summing node that will feed both the MediaStreamDestination (processedStream)
-  // and can be connected to AudioWorklet recorders deterministically.
+  // ** START: RECORDER BUS WIRING **
+  // create a stable recorder bus that worklets can connect to for deterministic capture
   recorderSum = audioCtx.createGain();
   recorderSum.gain.value = 1;
 
-  // route dry + fx into both the master gate and the recorder sum
-  // keep existing routing to mixDest for backward compatibility
-  dryGain.connect(mixDest);
-  fxSumGain.connect(mixDest);
-  processedStream = mixDest.stream;
-
-  // also feed the recorderSum so audioWorklet can capture the same summed signal
-  // (do not disconnect existing wiring - recorderSum is an additional bus)
+  // route both dry & fx sum into the recorderSum so whatever is heard can be recorded
   try {
     dryGain.connect(recorderSum);
     fxSumGain.connect(recorderSum);
-  } catch(e){
-    console.warn('Failed to wire recorderSum (will still attempt worklet connect):', e);
+  } catch (e) {
+    console.warn('recorderSum wiring failed:', e);
   }
+  // ** END: RECORDER BUS WIRING **
+
+  // Recording stream (for MediaRecorder fallback)
+  mixDest = audioCtx.createMediaStreamDestination();
+  dryGain.connect(mixDest);
+  fxSumGain.connect(mixDest);
+  processedStream = mixDest.stream;
 
   // MASTER BUS (final mix for export)
   masterBus = audioCtx.createGain();
@@ -512,7 +510,7 @@ class Looper {
     this.recordKey = recordKey; this.stopKey = stopKey;
     this.state = 'ready';
 
-    // MediaRecorder for fallback, Worklet for main recording
+    // MediaRecorder for overdubs (FALLBACK ONLY), Worklet for main recording & overdub
     this.mediaRecorder = null;
     this.chunks = [];
     this.workletNode = null;
@@ -589,24 +587,16 @@ class Looper {
     // Try to create the AudioWorkletNode (safe, but don't block visuals if it fails)
     try {
       this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
-
-      // If any before-FX is enabled, record the processed (fxSumGain) signal so loops include before-FX.
-      // Otherwise, record dryGain (previous behavior).
-      try {
-        const shouldRecordProcessed = beforeState.reverb || beforeState.delay || beforeState.flanger || beforeState.eq5;
-        if (shouldRecordProcessed) {
-          // try to connect processed bus first
-          recorderSum.connect(this.workletNode);
-        } else {
-          dryGain.connect(this.workletNode);
-        }
-      } catch (e) {
-        console.warn('Recorder worklet connect failed, falling back to dryGain:', e);
-        try { dryGain.connect(this.workletNode); } catch (e2) { console.error('Fallback connect failed', e2); }
+      
+      // Always connect from the unified recorderSum bus
+      if (recorderSum) {
+        recorderSum.connect(this.workletNode);
+      } else {
+        // Fallback for safety, though recorderSum should exist
+        dryGain.connect(this.workletNode);
       }
 
       this.workletNode.port.postMessage({ cmd: 'reset' });
-
 
       // keep previous behavior: schedule stop when time's up
       setTimeout(()=> this._stopWorkletRecording(), lenSec * 1000);
@@ -617,7 +607,7 @@ class Looper {
       // still schedule a fallback stop so the ring completes
       setTimeout(() => {
         // if we ever created part of the node, try to stop/cleanup
-        try { if (this.workletNode) { dryGain.disconnect(this.workletNode); fxSumGain.disconnect(this.workletNode); this.workletNode.disconnect(); } } catch (e) {}
+        try { if (this.workletNode) { recorderSum.disconnect(this.workletNode); this.workletNode.disconnect(); } } catch (e) {}
         // move to 'playing' state so UI updates (playback won't start because there's no buffer)
         this.state = 'playing';
         this.updateUI();
@@ -675,7 +665,6 @@ class Looper {
     };
     node.port.postMessage({ cmd:'dump' });
 
-    try { dryGain.disconnect(node); } catch(e) {}
     try { recorderSum.disconnect(node); } catch(e) {}
     try { node.disconnect(); } catch(e) {}
     this.workletNode = null;
@@ -727,7 +716,7 @@ class Looper {
     if (this.state==='ready') await this.phaseLockedRecord();
     else if (this.state==='recording') await this.stopRecordingAndPlay();
     else if (this.state==='playing') this.armOverdub();
-    else if (this.state==='overdub') this.finishOverdub(); // This will now be handled by worklet dump, but keep for fallback
+    else if (this.state==='overdub') this.finishOverdub(); // This will now be handled by worklet dump
   }
 
   async phaseLockedRecord(){
@@ -760,7 +749,6 @@ abortRecording(){
     if (this.workletNode) {
         try {
             this.workletNode.port.postMessage({ cmd:'reset' });
-            dryGain.disconnect(this.workletNode);
             recorderSum.disconnect(this.workletNode);
             this.workletNode.disconnect();
         } catch {}
@@ -860,138 +848,126 @@ abortRecording(){
 
   stopPlayback(){ if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} } this.state='stopped'; this.updateUI(); }
 
-  // Replace armOverdub() with this sample-accurate arming logic
+  // *******************************************************************
+  // ** START: NEW SAMPLE-ACCURATE armOverdub AND HELPER METHODS
+  // *******************************************************************
   async armOverdub(){
-    if (this.state !== 'playing') return;
-    this.state = 'overdub'; this.updateUI();
+      if (this.state !== 'playing') return;
+      this.state = 'overdub'; this.updateUI();
 
-    // compute absolute audio time of next loop boundary
-    const now = audioCtx.currentTime;
-    const elapsed = (now - this.loopStartTime) % this.loopDuration;
-    const toNext = this.loopDuration - elapsed;
-    const scheduledStartTime = now + toNext; // the exact audio time to start overdub
+      // compute absolute audio time of next loop boundary
+      const now = audioCtx.currentTime;
+      const elapsed = (now - this.loopStartTime) % this.loopDuration;
+      const toNext = this.loopDuration - elapsed;
+      const scheduledStartTime = now + toNext; // exact audio time to start overdub
 
-    // create and connect an overdub recorder worklet **now** so it is running on the audio thread
-    try {
-      this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
+      // create and connect an overdub recorder worklet so it runs on audio thread
+      try {
+          this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
 
-      // connect our stable recorderSum (preferred) so the worklet records exactly what is heard
-      if (typeof recorderSum !== 'undefined' && recorderSum !== null) {
-        recorderSum.connect(this.overdubWorklet);
-        // mark connection if you track it elsewhere (optional)
-        try { isRecorderSumConnectedToWorklet.set(this.overdubWorklet, true); } catch(e){}
-      } else {
-        // defensive fallback: connect dryGain so some signal reaches the worklet
-        try { dryGain.connect(this.overdubWorklet); } catch(e){ console.warn('Fallback: failed to connect dryGain to overdub worklet', e); }
-      }
-
-      // reset worklet sample counter and compute sample window relative to reset
-      const resetTime = audioCtx.currentTime;
-      this.overdubWorklet.port.postMessage({ cmd: 'reset' });
-
-      const sr = audioCtx.sampleRate;
-      const startSample = Math.max(0, Math.round((scheduledStartTime - resetTime) * sr));
-      const lengthSamples = Math.round(this.loopDuration * sr);
-
-      // arm the worklet to capture the exact sample window; worklet will auto-dump when done
-      this.overdubWorklet.port.postMessage({ cmd: 'arm', startSample, lengthSamples });
-
-      // keep the scheduled start for accurate UI animation
-      this.overdubStartTime = scheduledStartTime;
-      this._overdubAnimate();
-
-      // handle dump when worklet finishes
-      this.overdubWorklet.port.onmessage = async (e) => {
-        if (!e.data) return;
-        if (e.data.cmd === 'dump') {
-          const { channels, length, sampleRate } = e.data;
-          if (!length || !channels || !channels.length) {
-            cleanupOverdub.call(this);
-            this.state = 'playing'; this.updateUI();
-            return;
+          // prefer the stable recorderSum bus (deterministic content)
+          if (typeof recorderSum !== 'undefined' && recorderSum !== null) {
+              recorderSum.connect(this.overdubWorklet);
+              try { isRecorderSumConnectedToWorklet.set(this.overdubWorklet, true); } catch(e){}
+          } else {
+              // fallback: dryGain
+              dryGain.connect(this.overdubWorklet);
           }
 
-          // Build AudioBuffer out of transferred Float32Array channels
-          const recBuf = audioCtx.createBuffer(channels.length, length, sampleRate);
-          channels.forEach((arr, ch) => recBuf.getChannelData(ch).set(arr));
+          // reset worklet sample counter and then arm it using sample indices
+          const resetTime = audioCtx.currentTime;
+          this.overdubWorklet.port.postMessage({ cmd: 'reset' });
 
-          // Resample to loopBuffer.sampleRate if necessary
-          let workBuf = recBuf;
-          if (this.loopBuffer && workBuf.sampleRate !== this.loopBuffer.sampleRate) {
-            const targetSR = this.loopBuffer.sampleRate;
-            const off = new OfflineAudioContext(workBuf.numberOfChannels, Math.ceil(workBuf.duration * targetSR), targetSR);
-            const src = off.createBufferSource();
-            src.buffer = workBuf;
-            src.connect(off.destination);
-            src.start(0);
-            workBuf = await off.startRendering();
+          const sr = audioCtx.sampleRate;
+          // startSample relative to the sample index after resetTime
+          const startSample = Math.max(0, Math.round((scheduledStartTime - resetTime) * sr));
+          const lengthSamples = Math.round(this.loopDuration * sr);
+
+          // arm it — processor will auto-dump when it captured the window
+          this.overdubWorklet.port.postMessage({ cmd: 'arm', startSample, lengthSamples });
+
+          // set UI timing anchor and animate (the ring will display based on overdubStartTime)
+          this.overdubStartTime = scheduledStartTime;
+          this._overdubAnimate();
+
+          // handle dump when worklet finishes
+          this.overdubWorklet.port.onmessage = async (e) => {
+              if (!e.data) return;
+              if (e.data.cmd === 'dump') {
+                  const { channels, length, sampleRate } = e.data;
+                  if (!length || !channels || !channels.length) {
+                      cleanupOverdub.call(this);
+                      this.state = 'playing'; this.updateUI();
+                      return;
+                  }
+
+                  // Build AudioBuffer out of transferred Float32Array channels
+                  const recBuf = audioCtx.createBuffer(channels.length, length, sampleRate);
+                  channels.forEach((arr, ch) => recBuf.getChannelData(ch).set(arr));
+
+                  // Resample if needed
+                  let workBuf = recBuf;
+                  if (this.loopBuffer && workBuf.sampleRate !== this.loopBuffer.sampleRate) {
+                      const targetSR = this.loopBuffer.sampleRate;
+                      const off = new OfflineAudioContext(workBuf.numberOfChannels, Math.ceil(workBuf.duration * targetSR), targetSR);
+                      const src = off.createBufferSource();
+                      src.buffer = workBuf;
+                      src.connect(off.destination);
+                      src.start(0);
+                      workBuf = await off.startRendering();
+                  }
+
+                  // Mix sample-accurately (circular wrap) into this.loopBuffer
+                  this.mixBuffersCircularIntoLoop(workBuf);
+
+                  cleanupOverdub.call(this);
+                  this.state = 'playing';
+                  this.updateUI();
+              }
+          };
+
+          // cleanup helper
+          function cleanupOverdub(){
+              try { if (isRecorderSumConnectedToWorklet.get(this.overdubWorklet) && recorderSum) recorderSum.disconnect(this.overdubWorklet); } catch(_) {}
+              try { this.overdubWorklet.disconnect(); } catch(_) {}
+              try { this.overdubWorklet.port.close?.(); } catch(_) {}
+              try { isRecorderSumConnectedToWorklet.delete(this.overdubWorklet); } catch(_) {}
+              this.overdubWorklet = null;
           }
-
-          // Mix sample-accurately (circular wrap) into this.loopBuffer
-          this.mixBuffersCircularIntoLoop(workBuf);
-
-          cleanupOverdub.call(this);
-          this.state = 'playing'; this.updateUI();
-        }
-      };
-
-    } catch (err) {
-      console.warn('Overdub worklet creation failed — falling back to MediaRecorder (less accurate):', err);
-      showMsg('⚠️ AudioWorklet unavailable — overdub will use fallback encoder and timing will not be sample-accurate.', '#ffcc66');
-      // --- fallback: old MediaRecorder path (keep for degraded browsers) ---
-      // start the MediaRecorder-based overdub exactly at the next loop boundary using setTimeout
-      setTimeout(()=> this.startOverdubRecording(), Math.round(toNext*1000));
-    }
-
-    function cleanupOverdub(){
-      try { if (isRecorderSumConnectedToWorklet.get(this.overdubWorklet) && recorderSum) recorderSum.disconnect(this.overdubWorklet); } catch(_) {}
-      try { this.overdubWorklet.disconnect(); } catch(_) {}
-      try { this.overdubWorklet.port.close?.(); } catch(_) {}
-      try { isRecorderSumConnectedToWorklet.delete(this.overdubWorklet); } catch(_) {}
-      this.overdubWorklet = null;
-      if (this._recorderSumLocal){ try { this._recorderSumLocal.disconnect(); } catch(_) {} this._recorderSumLocal = null; }
-    }
-  }
-
-  // Mix workBuf into this.loopBuffer deterministically (circular wrap)
-  mixBuffersCircularIntoLoop(workBuf){
-    // if no existing loop, adopt the recorded buffer as the loop
-    if (!this.loopBuffer) {
-      this.loopBuffer = workBuf;
-      this.loopDuration = workBuf.duration;
-      this.startPlayback();
-      return;
-    }
-
-    const loopLen = this.loopBuffer.length;
-    const outCh = Math.max(this.loopBuffer.numberOfChannels, workBuf.numberOfChannels);
-
-    // create new buffer sized to existing loop length (preserve loop length)
-    const mixed = audioCtx.createBuffer(outCh, loopLen, this.loopBuffer.sampleRate);
-
-    // copy existing loop
-    for (let ch = 0; ch < outCh; ch++){
-      const outD = mixed.getChannelData(ch);
-      const oldD = ch < this.loopBuffer.numberOfChannels ? this.loopBuffer.getChannelData(ch) : new Float32Array(loopLen);
-      outD.set(oldD);
-    }
-
-    // add recorded audio wrapping circularly
-    for (let ch = 0; ch < workBuf.numberOfChannels; ch++){
-      const recD = workBuf.getChannelData(ch);
-      for (let i = 0; i < recD.length; i++){
-        const idx = i % loopLen;
-        mixed.getChannelData(ch)[idx] += recD[i];
+      } catch (err) {
+          console.warn('Overdub worklet creation failed — falling back to MediaRecorder (less accurate):', err);
+          showMsg('⚠️ AudioWorklet unavailable — overdub will use fallback encoder and timing will not be sample-accurate.', '#ffcc66');
+          // fallback previously implemented: schedule mediaRecorder path at next boundary
+          setTimeout(()=> this.startOverdubRecording(), Math.round(toNext*1000));
       }
-    }
-
-    this.loopBuffer = mixed;
-    this.loopDuration = mixed.duration;
-    // restart playback (maintains phase since loopStartTime remains unchanged)
-    this.startPlayback();
   }
   
-  // Kept for MediaRecorder fallback path
+  mixBuffersCircularIntoLoop(newBuffer) {
+      if (!this.loopBuffer || !newBuffer) return;
+
+      const oldBuf = this.loopBuffer;
+      const oldLen = oldBuf.length;
+      const newLen = newBuffer.length;
+      
+      // The output buffer will have the same dimensions as the original loop buffer
+      const numCh = oldBuf.numberOfChannels;
+
+      for (let ch = 0; ch < numCh; ch++) {
+          const oldData = oldBuf.getChannelData(ch);
+          // Use new buffer's channel if it exists, otherwise use a silent array
+          const newData = (ch < newBuffer.numberOfChannels) ? newBuffer.getChannelData(ch) : new Float32Array(newLen);
+
+          for (let i = 0; i < newLen; i++) {
+              // Use modulo operator to wrap around the old buffer's length
+              const oldIndex = i % oldLen;
+              oldData[oldIndex] += newData[i];
+              // You might want to clamp the value to prevent clipping, though simple addition is common
+              // oldData[oldIndex] = Math.max(-1.0, Math.min(1.0, oldData[oldIndex]));
+          }
+      }
+  }
+
+  // Fallback for older browsers (less accurate)
   startOverdubRecording(){
     this.overdubStartTime = audioCtx.currentTime;
     this.overdubChunks=[]; this.mediaRecorder=new MediaRecorder(processedStream);
@@ -1003,8 +979,9 @@ abortRecording(){
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
 
-  // Kept for MediaRecorder fallback path
   finishOverdub(){
+      // This function is now primarily for the MediaRecorder FALLBACK path.
+      // The sample-accurate worklet path handles its own completion and mixing.
     if (this.mediaRecorder && this.mediaRecorder.state==='recording'){
       this.mediaRecorder.onstop = async ()=>{
         const od=new Blob(this.overdubChunks,{type:'audio/webm'}), arr=await od.arrayBuffer();
@@ -1021,14 +998,19 @@ abortRecording(){
         });
       };
       this.mediaRecorder.stop();
-    } else { 
-      // This branch can be hit if the worklet path is taken but finishOverdub is still called by handleMainBtn.
-      // Simply transition state back to playing.
-      this.state='playing'; 
-      this.updateUI(); 
+    } else if (this.state === 'overdub') { 
+        // If finishOverdub is called but there's no active MediaRecorder,
+        // it likely means the worklet is handling it or something was cancelled.
+        // We just transition the state back to playing.
+        this.state='playing'; 
+        this.updateUI();
     }
   }
 
+  // *******************************************************************
+  // ** END: NEW SAMPLE-ACCURATE armOverdub AND HELPER METHODS
+  // *******************************************************************
+  
   clearLoop(){
     if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} }
     this.loopBuffer=null; this.loopDuration=0; this.state='ready'; this.updateUI();
