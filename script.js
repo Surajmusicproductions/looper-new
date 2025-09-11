@@ -55,10 +55,10 @@ if (window.location.protocol === 'file:') {
 let micStream = null, micSource = null;
 
 // ======= GLOBAL (Before-FX) GRAPH =======
-let dryGain, fxSumGain, mixDest, processedStream, recorderSum;
+let dryGain, fxSumGain, mixDest, processedStream, recorderSum, recorderTapGain;
 
 // Reverb (Before)
-let convolver, reverbPreDelay, reverbWet;
+let convolver, reverbPreDelay, reverbWet, reverbLowpass;
 // wiring guards to avoid duplicate connects
 let _reverbWired = false;
 let _delayWired = false;
@@ -197,7 +197,11 @@ async function ensureMic(){
   convolver.normalize = true; // normalize IR energy -> avoids unexpected hiss/peaks
   convolver.buffer = makeReverbImpulse(reverbRoomSeconds, reverbDecay);
   reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0; // CORRECT: Start wet gain at 0
-  // Note: connection happens on-demand in wireBeforeFX
+  // Add a gentle lowpass to tame HF hiss from the synthetic IR
+  reverbLowpass = audioCtx.createBiquadFilter();
+  reverbLowpass.type = 'lowpass';
+  reverbLowpass.frequency.value = 12000;
+  convolver._lowpass = reverbLowpass; // Store for later tweaking if needed
 
   // --- Delay path ---
   delayNode = audioCtx.createDelay(2.0);
@@ -221,16 +225,20 @@ async function ensureMic(){
   mixDest = audioCtx.createMediaStreamDestination();
 
   // Create a stable summing node that always receives both dry and processed signal.
-  // Recorder / overdub must read from this summing node so toggling before-FX mid-record is audible.
   recorderSum = audioCtx.createGain();
   recorderSum.gain.value = 1.0;
+
+  // Tap point for sample-accurate recording, controlled by gain scheduling
+  recorderTapGain = audioCtx.createGain();
+  recorderTapGain.gain.value = 0; // Muted by default
+  recorderSum.connect(recorderTapGain);
 
   // route dry + fx into the recorder sum
   dryGain.connect(recorderSum);
   fxSumGain.connect(recorderSum);
 
   // recorder and overdub MediaStreamDestination read from recorderSum
-  recorderSum.connect(mixDest);
+  recorderTapGain.connect(mixDest); // Route tap to stream destination
   processedStream = mixDest.stream;
 
 
@@ -438,7 +446,8 @@ function wireBeforeFX(){
           if (!_reverbWired) {
             micSource.connect(reverbPreDelay);
             reverbPreDelay.connect(convolver);
-            convolver.connect(reverbWet);
+            convolver.connect(reverbLowpass);
+            reverbLowpass.connect(reverbWet);
             reverbWet.connect(fxSumGain);
             _reverbWired = true;
           }
@@ -644,28 +653,20 @@ class Looper {
       this.workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
       this._connectedToRecorderSum = false;
 
-      // Always connect the worklet to the stable recorderSum so toggling Before-FX mid-record works.
-      try {
-        if (!isRecorderSumConnectedToWorklet.get(this.workletNode)) {
-            // recorderSum is our stable summing node of dry + fx
-            if (typeof recorderSum === 'undefined' || recorderSum === null) {
-              // defensive fallback: create and wire a local sum if ensureMic wasn't run (shouldn't happen)
-              const _recSum = audioCtx.createGain();
-              dryGain.connect(_recSum);
-              fxSumGain.connect(_recSum);
-              this._recorderSumLocal = _recSum; // store for cleanup later
-              _recSum.connect(this.workletNode);
-              this._connectedToRecorderSum = '_local';
-            } else {
-              recorderSum.connect(this.workletNode);
-              this._connectedToRecorderSum = true;
-            }
-            isRecorderSumConnectedToWorklet.set(this.workletNode, true);
-        }
-      } catch (e) {
-        console.warn('Recorder worklet connect failed to recorderSum, falling back to dryGain:', e);
-        try { dryGain.connect(this.workletNode); } catch (e2) { console.error('Fallback connect failed', e2); }
+      // Connect through the schedulable recorderTapGain for consistency
+      if (typeof recorderTapGain !== 'undefined' && recorderTapGain) {
+          recorderTapGain.connect(this.workletNode);
+          this._connectedToRecorderSum = true; // Still using this flag for cleanup logic
+          // Schedule tap gain to be open for recording
+          const now = audioCtx.currentTime;
+          recorderTapGain.gain.cancelScheduledValues(now);
+          recorderTapGain.gain.setValueAtTime(1, now);
+      } else if (typeof recorderSum !== 'undefined' && recorderSum) {
+          // fallback: direct connection if tap gain is missing
+          recorderSum.connect(this.workletNode);
+          this._connectedToRecorderSum = true;
       }
+
 
       this.workletNode.port.postMessage({ cmd: 'reset' });
 
@@ -688,6 +689,14 @@ class Looper {
 
   async _stopWorkletRecording(){
     if (!this.workletNode) return;
+
+    // Mute the tap gain for main recording
+    if (typeof recorderTapGain !== 'undefined' && recorderTapGain) {
+      const now = audioCtx.currentTime;
+      recorderTapGain.gain.cancelScheduledValues(now);
+      recorderTapGain.gain.setValueAtTime(0, now);
+    }
+
     this.state='playing'; this.updateUI();
 
     const node = this.workletNode;
@@ -737,20 +746,11 @@ class Looper {
     node.port.postMessage({ cmd:'dump' });
 
     try {
-      if (this._connectedToRecorderSum === '_local' && this._recorderSumLocal) {
-        // local temporary sum: disconnect it and free it
-        try { this._recorderSumLocal.disconnect(node); } catch(e){}
-        try { dryGain.disconnect(this._recorderSumLocal); } catch(e){}
-        try { fxSumGain.disconnect(this._recorderSumLocal); } catch(e){}
-        this._recorderSumLocal = null;
-      } else {
-        try { if (typeof recorderSum !== 'undefined' && recorderSum) recorderSum.disconnect(node); } catch(e){}
-      }
+        if (this._connectedToRecorderSum) {
+            if (recorderTapGain) recorderTapGain.disconnect(node);
+            else if (recorderSum) recorderSum.disconnect(node);
+        }
     } catch(e){ /* ignore */ }
-
-    // also attempt to remove any direct dry/fx connects if they were applied as fallback
-    try { dryGain.disconnect(node); } catch(e){}
-    try { fxSumGain.disconnect(node); } catch(e){}
 
     try { node.disconnect(); } catch(e){}
     this.workletNode = null;
@@ -803,7 +803,7 @@ class Looper {
     if (this.state==='ready') await this.phaseLockedRecord();
     else if (this.state==='recording') await this.stopRecordingAndPlay();
     else if (this.state==='playing') this.armOverdub();
-    else if (this.state==='overdub') this.finishOverdub();
+    else if (this.state==='overdub') {} // Overdub now finishes automatically
   }
 
   async phaseLockedRecord(){
@@ -836,19 +836,11 @@ abortRecording(){
     if (this.workletNode) {
         try {
             this.workletNode.port.postMessage({ cmd:'reset' });
-            dryGain.disconnect(this.workletNode);
-            fxSumGain.disconnect(this.workletNode);
+            if (recorderTapGain) recorderTapGain.disconnect(this.workletNode);
+            else if (recorderSum) recorderSum.disconnect(this.workletNode);
             this.workletNode.disconnect();
         } catch {}
         this.workletNode = null;
-    }
-    if (this.mediaRecorder && this.state==='recording'){
-      try {
-        this.mediaRecorder.ondataavailable = null;
-        this.mediaRecorder.onstop = null;
-        this.mediaRecorder.stop();
-      } catch {}
-      this.mediaRecorder=null; this.chunks=[];
     }
     this.state='ready';
     this.loopBuffer=null;
@@ -920,9 +912,12 @@ abortRecording(){
       const master = loopers[1]; const now = audioCtx.currentTime - master.loopStartTime;
       off = now % masterLoopDuration; if (isNaN(off)||off<0||off>this.loopBuffer.duration) off=0;
     }
-    this.loopStartTime = audioCtx.currentTime - off;
+    
+    const startTime = audioCtx.currentTime + 0.005;
+    try { this.sourceNode.start(startTime, off); } catch { try { this.sourceNode.start(0, off); } catch {} }
+    this.loopStartTime = startTime - off;
+
     this._rebuildChainWiring();
-    try{ this.sourceNode.start(0, off); }catch{ try{ this.sourceNode.start(0,0); }catch{} }
     this.state='playing'; this.updateUI(); this._animate();
     renderTrackFxSummary(this.index);
   }
@@ -936,7 +931,6 @@ abortRecording(){
 
   stopPlayback(){ if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} } this.state='stopped'; this.updateUI(); }
 
-  // ----- Replace armOverdub() -----
   armOverdub(){
     if (this.state!=='playing') return;
     // schedule overdub to start exactly on next loop boundary
@@ -945,144 +939,110 @@ abortRecording(){
     // elapsed into this loop
     const elapsed = (now - this.loopStartTime) % this.loopDuration;
     const toNext = this.loopDuration - elapsed;
-    // schedule start precisely at audio time using setTimeout for UI but record start time from audioCtx when starting
+    // schedule start precisely at audio time
     setTimeout(()=> this.startOverdubRecording(), Math.max(0, toNext*1000));
   }
 
-  // ----- Replace startOverdubRecording() -----
   startOverdubRecording(){
-    // start sample-accurate capture via AudioWorklet processor (same as main recorder)
-    this.overdubStartTime = audioCtx.currentTime; // reference
+    this.overdubStartTime = audioCtx.currentTime; // for animation timing
     this.state = 'overdub';
     this.updateUI();
     this._overdubAnimate();
 
-    // Create worklet node to capture from recorderSum (stable dry+fx)
     try {
-      this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
-      // connect stable recorderSum to worklet (use same stable sum as main record)
-      if (recorderSum) {
-        recorderSum.connect(this.overdubWorklet);
-        isRecorderSumConnectedToWorklet.set(this.overdubWorklet, true);
-        this._connectedToRecorderSum = true;
-      } else {
-        // defensive fallback: connect dryGain + fxSumGain
-        try { dryGain.connect(this.overdubWorklet); fxSumGain.connect(this.overdubWorklet); } catch(e){ console.warn('fallback connect for overdub failed', e); }
-        this._connectedToRecorderSum = false;
-      }
+        this.overdubWorklet = new AudioWorkletNode(audioCtx, 'recorder-processor', { numberOfInputs: 1, channelCount: 2 });
+        
+        if (!recorderTapGain) {
+            console.warn('recorderTapGain not found, overdub may fail.');
+            this.state = 'playing'; this.updateUI(); return;
+        }
 
-      this.overdubWorklet.port.postMessage({ cmd: 'reset' });
-    } catch (e){
-      console.warn('Overdub worklet creation failed — overdub will fall back (less accurate):', e);
-      this.overdubWorklet = null;
-      // keep mediaRecorder fallback only if necessary (not ideal)
-      this.overdubChunks=[]; this.mediaRecorder = new MediaRecorder(processedStream);
-      this.mediaRecorder.ondataavailable = ev=>{ if (ev.data.size>0) this.overdubChunks.push(ev.data); };
-      this.mediaRecorder.start();
+        recorderTapGain.connect(this.overdubWorklet);
+        this._connectedToTap = true;
+
+        this.overdubWorklet.port.onmessage = (e) => this.finishOverdub(e);
+        this.overdubWorklet.port.postMessage({ cmd: 'reset' });
+
+        const now = audioCtx.currentTime;
+        const scheduledStart = now;
+        const scheduledStop = scheduledStart + this.loopDuration;
+
+        recorderTapGain.gain.cancelScheduledValues(now);
+        recorderTapGain.gain.setValueAtTime(0, scheduledStart);
+        recorderTapGain.gain.linearRampToValueAtTime(1, scheduledStart + 0.002);
+        recorderTapGain.gain.setValueAtTime(1, scheduledStop);
+        recorderTapGain.gain.linearRampToValueAtTime(0, scheduledStop + 0.002);
+
+        setTimeout(() => {
+            if (this.overdubWorklet) {
+                this.overdubWorklet.port.postMessage({ cmd: 'dump' });
+            }
+        }, (this.loopDuration * 1000) + 50);
+
+    } catch (e) {
+        console.error('Failed to start sample-accurate overdub:', e);
+        this.state = 'playing';
+        this.updateUI();
     }
-
-    // schedule precise stop/dump after exactly loopDuration seconds (use setTimeout for timing, then rely on worklet dump)
-    setTimeout(()=> this.finishOverdub(), Math.round(this.loopDuration * 1000));
   }
 
-  // ----- Replace finishOverdub() -----
-  async finishOverdub(){
-    // If we used MediaRecorder fallback, decode and merge (legacy brittle path)
-    if (this.mediaRecorder && this.mediaRecorder.state === 'recording'){
-      this.mediaRecorder.onstop = async ()=>{
-        const od = new Blob(this.overdubChunks, { type: 'audio/webm' });
-        const arr = await od.arrayBuffer();
-        const newBuf = await audioCtx.decodeAudioData(arr);
-        // naive merge (legacy): align start to 0 and sum
-        const oC = this.loopBuffer.numberOfChannels, nC = newBuf.numberOfChannels;
-        const outC = Math.max(oC, nC);
-        const length = Math.max(this.loopBuffer.length, newBuf.length);
-        const out = audioCtx.createBuffer(outC, length, this.loopBuffer.sampleRate);
-        for (let ch=0; ch<outC; ch++){
-          const outD = out.getChannelData(ch), o = oC>ch?this.loopBuffer.getChannelData(ch):null, n = nC>ch?newBuf.getChannelData(ch):null;
-          for (let i=0;i<length;i++) outD[i] = (o?o[i]||0:0) + (n?n[i]||0:0);
-        }
-        this.loopBuffer = out; this.loopDuration = out.duration; this.startPlayback();
-        this.mediaRecorder = null; this.overdubChunks = [];
-        this.state = 'playing'; this.updateUI();
-      };
-      try { this.mediaRecorder.stop(); } catch(e){ console.warn('mediaRecorder stop failed', e); }
-      return;
-    }
+  async finishOverdub(e){
+    if (!e.data || e.data.cmd !== 'dump') return;
 
-    // If we created an overdubWorklet — ask it to dump its recorded frames
-    if (this.overdubWorklet){
-      const node = this.overdubWorklet;
-      const dumpPromise = new Promise((resolve, reject) => {
-        const timeout = setTimeout(()=> reject(new Error('worklet dump timeout')), 3000);
-        node.port.onmessage = (e) => {
-          if (e.data?.cmd === 'dump'){
-            clearTimeout(timeout);
-            resolve(e.data);
-          }
-        };
-      });
+    const node = this.overdubWorklet;
+    if (!node) return;
 
-      // ask worklet to dump
-      node.port.postMessage({ cmd: 'dump' });
-
-      try {
-        const e = await dumpPromise;
-        // e: { channels: [Float32Array,...], length, sampleRate }
-        if (!e || e.length === 0) {
-          // nothing recorded — return to playing
-          try {
-            if (this._connectedToRecorderSum && typeof recorderSum !== 'undefined' && recorderSum) recorderSum.disconnect(node);
-            else { try { dryGain.disconnect(node); fxSumGain.disconnect(node); } catch{} }
-          } catch(e2){}
-          try { node.disconnect(); } catch(e3){}
-          this.overdubWorklet = null;
-          this.state = 'playing'; this.updateUI();
-          return;
+    try {
+        const dumpData = e.data;
+        if (!dumpData || dumpData.length === 0) {
+            this.state = 'playing';
+            this.updateUI();
+            return;
         }
 
-        const sr = e.sampleRate || audioCtx.sampleRate;
-        const newBuf = audioCtx.createBuffer(e.channels.length, e.length, sr);
-        e.channels.forEach((chData, ch)=> newBuf.getChannelData(ch).set(chData));
+        const sr = dumpData.sampleRate || audioCtx.sampleRate;
+        const newBuf = audioCtx.createBuffer(dumpData.channels.length, dumpData.length, sr);
+        dumpData.channels.forEach((chData, ch) => newBuf.getChannelData(ch).set(chData));
 
-        // Now merge newBuf sample-accurately with this.loopBuffer.
-        // Ensure both buffers are same sampleRate (they should be).
         const oC = this.loopBuffer.numberOfChannels, nC = newBuf.numberOfChannels;
         const outC = Math.max(oC, nC);
         const lengthSamples = Math.max(this.loopBuffer.length, newBuf.length);
         const out = audioCtx.createBuffer(outC, lengthSamples, this.loopBuffer.sampleRate);
-        for (let ch=0; ch<outC; ch++){
-          const outD = out.getChannelData(ch);
-          const oD = oC>ch? this.loopBuffer.getChannelData(ch) : null;
-          const nD = nC>ch? newBuf.getChannelData(ch) : null;
-          for (let i=0;i<lengthSamples;i++){
-            const a = oD ? (oD[i] || 0) : 0;
-            const b = nD ? (nD[i] || 0) : 0;
-            outD[i] = a + b;
-          }
+        
+        // Use a 50ms crossfade to prevent clicks at the loop seam
+        const crossfadeSamples = Math.floor(sr * 0.05);
+
+        for (let ch = 0; ch < outC; ch++) {
+            const outD = out.getChannelData(ch);
+            const oD = oC > ch ? this.loopBuffer.getChannelData(ch) : null;
+            const nD = nC > ch ? newBuf.getChannelData(ch) : null;
+            for (let i = 0; i < lengthSamples; i++) {
+                const a = oD ? (oD[i] || 0) : 0;
+                const b = nD ? (nD[i] || 0) : 0;
+                
+                let fade = 1.0;
+                if (i > lengthSamples - crossfadeSamples && lengthSamples > crossfadeSamples) {
+                    fade = (lengthSamples - i) / crossfadeSamples;
+                }
+                outD[i] = a + (b * fade);
+            }
         }
 
-        // replace loop buffer & restart playback aligned exactly
         this.loopBuffer = out;
         this.loopDuration = out.duration;
         this.startPlayback();
 
-      } catch (err){
-        console.warn('Overdub dump error:', err);
+    } catch (err) {
+        console.warn('Overdub processing error:', err);
         this.state = 'playing';
         this.updateUI();
-      } finally {
-        // cleanup connections
-        try {
-          if (this._connectedToRecorderSum && typeof recorderSum !== 'undefined' && recorderSum) recorderSum.disconnect(node);
-          else { try { dryGain.disconnect(node); fxSumGain.disconnect(node); } catch{} }
-        } catch(e){}
-        try { node.disconnect(); } catch(e){}
+    } finally {
+        if (this._connectedToTap && recorderTapGain) {
+            try { recorderTapGain.disconnect(node); } catch(err) {}
+        }
+        try { node.disconnect(); } catch (err) {}
         this.overdubWorklet = null;
-      }
-    } else {
-      // no worklet and no MediaRecorder — just return to playing
-      this.state = 'playing'; this.updateUI();
+        this._connectedToTap = false;
     }
   }
 
@@ -1254,7 +1214,7 @@ function renderFxParamsBody(fx){
 function wireFxParams(lp, fx){
   if (fx.type==='Pitch'){ $('#pSem').addEventListener('input', e=>{ fx.params.semitones = parseInt(e.target.value,10); $('#pSemVal').textContent = fx.params.semitones; lp.pitchSemitones = fx.params.semitones; if (lp.state==='playing') lp._applyPitchIfAny(); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='LowPass'){ $('#lpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#lpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#lpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
-  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#hpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
+  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Pan'){ $('#pan').addEventListener('input', e=>{ fx.params.pan = parseFloat(e.target.value); $('#panVal').textContent = fx.params.pan.toFixed(2); if (fx.nodes?.panner) fx.nodes.panner.pan.setTargetAtTime(fx.params.pan, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='Delay'){ $('#dTime').addEventListener('input', e=>{ fx.params.timeSec = parseInt(e.target.value,10)/1000; $('#dTimeVal').textContent = `${parseInt(e.target.value,10)} ms`; if (fx.nodes?.d) fx.nodes.d.delayTime.setTargetAtTime(fx.params.timeSec, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#dFb').addEventListener('input', e=>{ fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01); }); $('#dMix').addEventListener('input', e=>{ fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.wet) fx.nodes.wet.gain.setTargetAtTime(clamp(fx.params.mix,0,1), audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Compressor'){ $('#cTh').addEventListener('input', e=>{ fx.params.threshold = parseInt(e.target.value,10); $('#cThVal').textContent = fx.params.threshold+' dB'; if (fx.nodes?.comp) fx.nodes.comp.threshold.setTargetAtTime(fx.params.threshold, audioCtx.currentTime, 0.01); }); $('#cRa').addEventListener('input', e=>{ fx.params.ratio = parseFloat(e.target.value); $('#cRaVal').textContent = fx.params.ratio+':1'; if (fx.nodes?.comp) fx.nodes.comp.ratio.setTargetAtTime(fx.params.ratio, audioCtx.currentTime, 0.01); }); $('#cKn').addEventListener('input', e=>{ fx.params.knee = parseInt(e.target.value,10); $('#cKnVal').textContent = fx.params.knee+' dB'; if (fx.nodes?.comp) fx.nodes.comp.knee.setTargetAtTime(fx.params.knee, audioCtx.currentTime, 0.01); }); $('#cAt').addEventListener('input', e=>{ fx.params.attack = parseFloat(e.target.value)/1000; $('#cAtVal').textContent = (fx.params.attack*1000).toFixed(1)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.attack.setTargetAtTime(fx.params.attack, audioCtx.currentTime, 0.01); }); $('#cRl').addEventListener('input', e=>{ fx.params.release = parseFloat(e.target.value)/1000; $('#cRlVal').textContent = (fx.params.release*1000).toFixed(0)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.release.setTargetAtTime(fx.params.release, audioCtx.currentTime, 0.01); }); }
@@ -1515,3 +1475,4 @@ function toggleEQ(enabled) {
         eq.connected = false;
     }
 }
+
