@@ -4,8 +4,8 @@
    - Up/Down reordering with numbers
    - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
-   Patched based on user feedback to fix live monitor echo and consolidate code.
    Patched for Sample-Accurate Overdubbing: 2025-09-11
+   Patched for Master Recording & Sync: 2025-09-12
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -597,6 +597,13 @@ class Looper {
       }
 
       this.workletNode.port.postMessage({ cmd: 'reset' });
+      
+      // --- PATCH: ARM the worklet so it captures the upcoming window (start at 0 relative to reset) ---
+      const sr = audioCtx.sampleRate;
+      const lengthSamples = Math.round(lenSec * sr);
+      this.workletNode.port.postMessage({ cmd: 'arm', startSample: 0, lengthSamples });
+      console.log(`Armed recorder worklet for ${lengthSamples} samples (${lenSec}s)`);
+      // -----------------------------------------------------------------------------------------
 
       // keep previous behavior: schedule stop when time's up
       setTimeout(()=> this._stopWorkletRecording(), lenSec * 1000);
@@ -661,6 +668,20 @@ class Looper {
           for (let k=2;k<=4;k++) loopers[k].disable(false);
         }
         this.startPlayback();
+
+        // --- PATCH: Re-sync other tracks to the new master anchor time ---
+        if (this.index === 1) {
+          // guarantee master anchor
+          this.loopStartTime = audioCtx.currentTime;
+          // force re-sync of playing tracks (safe no-op if they are not playing)
+          for (let k = 2; k <= 4; k++) {
+            if (window.loopers && loopers[k] && loopers[k].state === 'playing') {
+              loopers[k].startPlayback(); // recomputes off using master.loopStartTime
+            }
+          }
+          console.log('Master anchor set — re-synced tracks 2..4 to', this.loopStartTime);
+        }
+        // -----------------------------------------------------------------
       }
     };
     node.port.postMessage({ cmd:'dump' });
