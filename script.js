@@ -5,6 +5,7 @@
    - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
    Patched for Sample-Accurate Overdubbing: 2025-09-12
+   Patched for RC-505 Style Animation: 2025-09-12
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -961,8 +962,9 @@ class Looper {
 
       this.overdubWorklet.port.postMessage({ cmd: 'arm', startSample: armStartSample, lengthSamples });
 
-      // animate UI based on scheduled start time (overdubStartTime)
-      this._overdubAnimate();
+      // === ANIMATION FIX ===
+      // Animate UI based on the main loop's playhead position, not the overdub start time.
+      this._animate();
 
       // on dump: trim the preroll and mix at sample-accurate offset
       this.overdubWorklet.port.onmessage = async (e) => {
@@ -1078,7 +1080,7 @@ class Looper {
     this.mediaRecorder.ondataavailable = e=>{ if (e.data.size>0) this.overdubChunks.push(e.data); };
     this.mediaRecorder.start();
 
-    this._overdubAnimate(); // start overdub ring animation
+    this._animate(); // Use unified animation for fallback too
 
     setTimeout(()=>this.finishOverdub(), this.loopDuration*1000);
   }
@@ -1126,20 +1128,20 @@ class Looper {
     }
   }
 
+  // === ANIMATION FIX ===
+  // This function now handles BOTH playing and overdubbing to ensure the ring
+  // always represents the main loop's playhead, just like on a Boss RC-505.
   _animate(){
-    if (this.state==='playing' && this.loopDuration>0 && this.sourceNode){
-      const now = audioCtx.currentTime; const pos=(now - this.loopStartTime)%this.loopDuration;
-      this.setRing(pos/this.loopDuration); requestAnimationFrame(this._animate.bind(this));
-    } else { this.setRing(0); }
-  }
-  _overdubAnimate(){
-    if (this.state==='overdub' && this.loopDuration>0){
-      const now = audioCtx.currentTime;
-      const pos = (now - this.overdubStartTime) % this.loopDuration;
-      this.setRing(pos / this.loopDuration);
-      requestAnimationFrame(this._overdubAnimate.bind(this));
+    if ((this.state==='playing' || this.state==='overdub') && this.loopDuration>0 && this.sourceNode){
+      const now = audioCtx.currentTime; 
+      const pos = (now - this.loopStartTime) % this.loopDuration;
+      this.setRing(pos / this.loopDuration); 
+      requestAnimationFrame(this._animate.bind(this));
+    } else { 
+      this.setRing(0); 
     }
   }
+  // The _overdubAnimate() function has been removed as it is now redundant.
 }
 
 // ======= BUILD LOOPERS + KEYBINDS =======
@@ -1283,7 +1285,7 @@ function renderFxParamsBody(fx){
 function wireFxParams(lp, fx){
   if (fx.type==='Pitch'){ $('#pSem').addEventListener('input', e=>{ fx.params.semitones = parseInt(e.target.value,10); $('#pSemVal').textContent = fx.params.semitones; lp.pitchSemitones = fx.params.semitones; if (lp.state==='playing') lp._applyPitchIfAny(); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='LowPass'){ $('#lpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#lpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#lpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
-  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#hpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
+  if (fx.type==='HighPass'){ $('#hpCut').addEventListener('input', e=>{ fx.params.cutoff = parseFloat(e.target.value); $('#hpCutVal').textContent = Math.round(fx.params.cutoff)+' Hz'; if (fx.nodes?.biq) fx.nodes.biq.frequency.setTargetAtTime(fx.params.cutoff, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#hpQ').addEventListener('input', e=>{ fx.params.q = parseFloat(e.target.value); $('#lpQVal').textContent = fx.params.q.toFixed(2); if (fx.nodes?.biq) fx.nodes.biq.Q.setTargetAtTime(fx.params.q, audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Pan'){ $('#pan').addEventListener('input', e=>{ fx.params.pan = parseFloat(e.target.value); $('#panVal').textContent = fx.params.pan.toFixed(2); if (fx.nodes?.panner) fx.nodes.panner.pan.setTargetAtTime(fx.params.pan, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); }
   if (fx.type==='Delay'){ $('#dTime').addEventListener('input', e=>{ fx.params.timeSec = parseInt(e.target.value,10)/1000; $('#dTimeVal').textContent = `${parseInt(e.target.value,10)} ms`; if (fx.nodes?.d) fx.nodes.d.delayTime.setTargetAtTime(fx.params.timeSec, audioCtx.currentTime, 0.01); renderTrackFxSummary(lp.index); }); $('#dFb').addEventListener('input', e=>{ fx.params.feedback = parseInt(e.target.value,10)/100; $('#dFbVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.fb) fx.nodes.fb.gain.setTargetAtTime(clamp(fx.params.feedback,0,0.95), audioCtx.currentTime, 0.01); }); $('#dMix').addEventListener('input', e=>{ fx.params.mix = parseInt(e.target.value,10)/100; $('#dMixVal').textContent = `${parseInt(e.target.value,10)}%`; if (fx.nodes?.wet) fx.nodes.wet.gain.setTargetAtTime(clamp(fx.params.mix,0,1), audioCtx.currentTime, 0.01); }); }
   if (fx.type==='Compressor'){ $('#cTh').addEventListener('input', e=>{ fx.params.threshold = parseInt(e.target.value,10); $('#cThVal').textContent = fx.params.threshold+' dB'; if (fx.nodes?.comp) fx.nodes.comp.threshold.setTargetAtTime(fx.params.threshold, audioCtx.currentTime, 0.01); }); $('#cRa').addEventListener('input', e=>{ fx.params.ratio = parseFloat(e.target.value); $('#cRaVal').textContent = fx.params.ratio+':1'; if (fx.nodes?.comp) fx.nodes.comp.ratio.setTargetAtTime(fx.params.ratio, audioCtx.currentTime, 0.01); }); $('#cKn').addEventListener('input', e=>{ fx.params.knee = parseInt(e.target.value,10); $('#cKnVal').textContent = fx.params.knee+' dB'; if (fx.nodes?.comp) fx.nodes.comp.knee.setTargetAtTime(fx.params.knee, audioCtx.currentTime, 0.01); }); $('#cAt').addEventListener('input', e=>{ fx.params.attack = parseFloat(e.target.value)/1000; $('#cAtVal').textContent = (fx.params.attack*1000).toFixed(1)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.attack.setTargetAtTime(fx.params.attack, audioCtx.currentTime, 0.01); }); $('#cRl').addEventListener('input', e=>{ fx.params.release = parseFloat(e.target.value)/1000; $('#cRlVal').textContent = (fx.params.release*1000).toFixed(0)+' ms'; if (fx.nodes?.comp) fx.nodes.comp.release.setTargetAtTime(fx.params.release, audioCtx.currentTime, 0.01); }); }
@@ -1544,3 +1546,4 @@ function toggleEQ(enabled) {
         eq.connected = false;
     }
 }
+
