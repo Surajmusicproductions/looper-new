@@ -4,8 +4,7 @@
    - Up/Down reordering with numbers
    - Pitch (playbackRate) available in After-FX; live input pitch shifting is NOT implemented
    Date: 2025-08-09 (Corrected Version: 2025-09-04)
-   Patched for Sample-Accurate Overdubbing: 2025-09-11
-   Patched for Master Recording & Sync: 2025-09-12
+   Patched for Sample-Accurate Overdubbing: 2025-09-12
 */
 
 // pick latencyHint based on platform (reduce underruns on weaker mobile devices)
@@ -917,7 +916,7 @@ class Looper {
   stopPlayback(){ if (this.sourceNode){ try{ this.sourceNode.stop(); this.sourceNode.disconnect(); }catch{} } this.state='stopped'; this.updateUI(); }
 
   // *******************************************************************
-  // ** START: NEW SAMPLE-ACCURATE armOverdub AND HELPER METHODS
+  // ** START: Patched SAMPLE-ACCURATE armOverdub AND HELPER METHODS
   // *******************************************************************
   // --- replaced armOverdub() for sample-accurate pre-roll, trim + offset insert
   async armOverdub(){
@@ -1009,6 +1008,8 @@ class Looper {
           let offsetSeconds = (this.overdubStartTime - this.loopStartTime) % this.loopDuration;
           if (offsetSeconds < 0) offsetSeconds += this.loopDuration;
           const insertOffsetSamples = Math.round(offsetSeconds * (this.loopBuffer ? this.loopBuffer.sampleRate : audioCtx.sampleRate));
+          
+          console.log(`Overdub insert offset (samples): ${insertOffsetSamples}`); // Diagnostic log
 
           // call updated mix that accepts offset
           this.mixBuffersCircularIntoLoop(workBuf, insertOffsetSamples);
@@ -1051,7 +1052,8 @@ class Looper {
 
     // small edge crossfade to avoid clicks (10ms)
     const fadeMs = 10;
-    const fadeSamples = Math.min(Math.round((fadeMs/1000) * sampleRate), newLen >> 2); // don't exceed buffer
+    const fadeSamples = Math.min(Math.round((fadeMs/1000) * sampleRate), Math.floor(newLen/4));
+
     for (let ch = 0; ch < numCh; ch++) {
       const oldData = oldBuf.getChannelData(ch < oldBuf.numberOfChannels ? ch : 0);
       const newData = (ch < newBuffer.numberOfChannels) ? newBuffer.getChannelData(ch) : new Float32Array(newLen);
@@ -1110,7 +1112,7 @@ class Looper {
   }
 
   // *******************************************************************
-  // ** END: NEW SAMPLE-ACCURATE armOverdub AND HELPER METHODS
+  // ** END: Patched SAMPLE-ACCURATE armOverdub AND HELPER METHODS
   // *******************************************************************
   
   clearLoop(){
