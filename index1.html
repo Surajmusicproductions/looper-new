@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Harmonica Tuner & Synth (Wasm Powered)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- CORRECTED: Now points to your actual JS file -->
+  <script src="pitch_detector.js"></script>
+  <style>
+    :root{
+      --bg:#1a1a1a; --panel:#2c2c2c; --text:#f0f0f0; --muted:#9e9e9e;
+      --accent:#ffa726; --blow-color: #4fc3f7; --draw-color: #ff8a65;
+      --bend-color: #fdd835; --card-shadow: 0 8px 30px rgba(0,0,0,0.5); --radius:12px;
+    }
+    body{ margin:0; background: var(--bg); color:var(--text); font-family: sans-serif; }
+    .container{ width:min(1100px, 94vw); margin: 12px auto 48px; display:grid; gap:16px; }
+    .panel{ background: #2c2c2c; border-radius:var(--radius); padding:18px; box-shadow: var(--card-shadow); }
+    .controls-row{ display:flex; gap:15px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+    .btn{ background:#424242; color:var(--text); border:1px solid rgba(255,255,255,0.1); padding:9px 12px; border-radius:10px; cursor:pointer; font-weight:600; }
+    .btn[disabled]{ opacity:.45; cursor:default; }
+    .switch-control { display: flex; align-items: center; gap: 8px; }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; inset: 0; background-color: #555; transition: .2s; border-radius: 24px; }
+    .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .2s; border-radius: 50%; }
+    input:checked + .slider { background-color: var(--accent); }
+    input:checked + .slider:before { transform: translateX(20px); }
+    .analysis-row{ margin-top:12px; display:flex; gap:18px; color:var(--muted); font-size:14px; }
+    .tuner-meter { height: 20px; width: 100%; background: linear-gradient(to right, #e53935, #fdd835, #43a047, #fdd835, #e53935); border-radius: 10px; position: relative; }
+    .tuner-needle { width: 3px; height: 100%; background: white; position: absolute; top: 0; left: 50%; transform: translateX(-50%); transition: transform 0.1s linear; }
+    #harmonica-container { padding: 15px; background: #1e1e1e; border-radius: 8px; margin-top: 15px; overflow-x: auto; }
+    #harmonica-display { display: grid; grid-template-rows: repeat(5, auto); gap: 4px; min-width: 600px; }
+    .harmonica-row { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; }
+    .harmonica-cell { display: flex; align-items: center; justify-content: center; min-height: 35px; border-radius: 4px; font-weight: bold; color: var(--muted); background: #333; }
+    .harmonica-cell.hole-number { background: #111; color: white; height: 40px; font-size: 18px; }
+    .harmonica-cell.note.active { color: #111; box-shadow: 0 0 15px 3px var(--active-color, var(--accent)); }
+    .harmonica-cell.blow.active { --active-color: var(--blow-color); background: var(--blow-color); }
+    .harmonica-cell.draw.active { --active-color: var(--draw-color); background: var(--draw-color); }
+    .harmonica-cell.blow-bend.active, .harmonica-cell.draw-bend.active { --active-color: var(--bend-color); background: var(--bend-color); }
+    .loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); color: white; display: flex; align-items: center; justify-content: center; font-size: 1.5em; z-index: 10; }
+  </style>
+</head>
+<body>
+  <div id="loading-overlay" class="loading-overlay">Loading Wasm Module...</div>
+  
+  <main class="container" style="visibility: hidden;">
+     <section class="panel">
+        <div class="controls-row">
+            <button id="btnMicToggle" class="btn">🎤 Start Listening</button>
+            <div class="switch-control">
+              <label class="switch"><input type="checkbox" id="soundToggle"><span class="slider"></span></label>
+              <span>Enable Sound</span>
+            </div>
+        </div>
+        <div class="analysis-row">
+            <div><strong>Note:</strong> <span id="detectedNote">—</span></div>
+            <div><strong>Action:</strong> <span id="detectedAction">—</span></div>
+            <div><strong>Tuning:</strong> <span id="tuner-cents">--</span> cents</div>
+        </div>
+        <div class="tuner"><div class="tuner-meter"><div id="tuner-needle" class="tuner-needle"></div></div></div>
+        <div id="harmonica-container"><div id="harmonica-display"></div></div>
+    </section>
+    <section class="panel">
+        <h2>Chromatic Reference Piano</h2>
+        <div id="keyboard" class="keyboard"></div>
+    </section>
+  </main>
+
+  <script>
+    let findPitchWasm = null;
+
+    // The 'Module' object is created by pitch_detector.js
+    // We tell it where to find the .wasm file.
+    var Module = {
+        locateFile: function(path, prefix) {
+            if (path.endsWith('.wasm')) {
+                return 'pitch_detector.wasm';
+            }
+            return prefix + path;
+        },
+        onRuntimeInitialized: () => {
+          console.log('WebAssembly module loaded.');
+          findPitchWasm = Module.cwrap(
+            'find_pitch', 'number', ['number', 'number', 'number']
+          );
+          document.getElementById('loading-overlay').style.display = 'none';
+          document.querySelector('.container').style.visibility = 'visible';
+        }
+    };
+
+    // --- Main Application Logic (Unchanged) ---
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const FFT_SIZE = 4096;
+    const MIN_ACCEPT_RMS = 0.008;
+    const ALL_NOTES = [];
+    const harmonicaLayout = [ { hole: 1, blow: { midi: 60, name: "C4" }, draw: { midi: 62, name: "D4" }, draw_bends: [{ midi: 61, name: "Db4" }] }, { hole: 2, blow: { midi: 64, name: "E4" }, draw: { midi: 67, name: "G4" }, draw_bends: [{ midi: 66, name: "F#4" }, { midi: 65, name: "F4" }] }, { hole: 3, blow: { midi: 67, name: "G4" }, draw: { midi: 71, name: "B4" }, draw_bends: [{ midi: 70, name: "Bb4" }, { midi: 69, name: "A4" }, { midi: 68, name: "Ab4" }] }, { hole: 4, blow: { midi: 72, name: "C5" }, draw: { midi: 74, name: "D5" }, draw_bends: [{ midi: 73, name: "Db5" }] }, { hole: 5, blow: { midi: 76, name: "E5" }, draw: { midi: 77, name: "F5" }}, { hole: 6, blow: { midi: 79, name: "G5" }, draw: { midi: 81, name: "A5" }, draw_bends: [{ midi: 80, name: "Ab5" }] }, { hole: 7, blow: { midi: 84, name: "C6" }, draw: { midi: 83, name: "B5" }}, { hole: 8, blow: { midi: 88, name: "E6" }, draw: { midi: 86, name: "D6" }, blow_bends: [{ midi: 87, name: "Eb6" }] }, { hole: 9, blow: { midi: 91, name: "G6" }, draw: { midi: 90, name: "F6" }, blow_bends: [{ midi: 92, name: "F#6" }] }, { hole: 10, blow: { midi: 96, name: "C7" }, draw: { midi: 93, name: "A6" }, blow_bends: [{ midi: 95, name: "Bb6" }] }];
+    harmonicaLayout.forEach(h => { if (h.blow) ALL_NOTES.push({ ...h.blow, type: 'blow', hole: h.hole }); if (h.draw) ALL_NOTES.push({ ...h.draw, type: 'draw', hole: h.hole }); (h.draw_bends || []).forEach(b => ALL_NOTES.push({ ...b, type: 'draw-bend', hole: h.hole })); (h.blow_bends || []).forEach(b => ALL_NOTES.push({ ...b, type: 'blow-bend', hole: h.hole })); });
+    ALL_NOTES.forEach(n => n.freq = 440 * Math.pow(2, (n.midi - 69) / 12));
+
+    let micStream, micAnalyser, micBuffer, micRunning = false, micTimer, lastDetectedNote = null;
+    let soundEnabled = false, activeVoice = null;
+    const id = x => document.getElementById(x);
+    const btnMicToggle = id('btnMicToggle'), soundToggle = id('soundToggle');
+    const detectedNoteEl = id('detectedNote'), detectedActionEl = id('detectedAction');
+    const tunerCentsEl = id('tuner-cents'), tunerNeedle = id('tuner-needle');
+    
+    function detect() {
+        if (!findPitchWasm) return;
+        micAnalyser.getFloatTimeDomainData(micBuffer);
+        let rms = 0; for(let v of micBuffer) rms += v*v;
+        if (Math.sqrt(rms / micBuffer.length) < MIN_ACCEPT_RMS) return clearDetection();
+
+        const bufferPtr = Module._malloc(micBuffer.length * micBuffer.BYTES_PER_ELEMENT);
+        Module.HEAPF32.set(micBuffer, bufferPtr / micBuffer.BYTES_PER_ELEMENT);
+        const freq = findPitchWasm(bufferPtr, micBuffer.length, audioCtx.sampleRate);
+        Module._free(bufferPtr);
+
+        if (freq <= 0) return clearDetection();
+        const detectedNote = findNoteForFrequency(freq);
+        if (!detectedNote) return clearDetection();
+        
+        const cents = 1200 * Math.log2(freq / detectedNote.freq);
+        updateVisuals(detectedNote, cents);
+        if (!lastDetectedNote || lastDetectedNote.midi !== detectedNote.midi) noteOn(detectedNote.freq);
+        lastDetectedNote = detectedNote;
+    }
+
+    function noteOn(freq) { /* ... same as before ... */ }
+    function noteOff() { /* ... same as before ... */ }
+    function findNoteForFrequency(freq) { /* ... same as before ... */ }
+    function buildHarmonicaDisplay() { /* ... same as before ... */ }
+    function updateVisuals(noteInfo, cents) { /* ... same as before ... */ }
+    function updateTuner(cents) { /* ... same as before ... */ }
+    function clearDetection() { /* ... same as before ... */ }
+    async function toggleMic() { /* ... same as before ... */ }
+    function buildKeyboard() { /* ... same as before ... */ }
+
+    // --- Inlined Functions for brevity (they are unchanged) ---
+    function noteOn(freq) { if (!soundEnabled) return; if (activeVoice) noteOff(); const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain(); osc.type = 'sine'; osc.frequency.setValueAtTime(freq, audioCtx.currentTime); gain.gain.setValueAtTime(0, audioCtx.currentTime); gain.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.05); osc.connect(gain).connect(audioCtx.destination); osc.start(); activeVoice = { osc, gain }; }
+    function noteOff() { if (activeVoice) { activeVoice.gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05); activeVoice.osc.stop(audioCtx.currentTime + 0.1); activeVoice = null; } }
+    function findNoteForFrequency(freq) { let closestNote = null; let minDiff = Infinity; ALL_NOTES.forEach(note => { const diff = Math.abs(freq - note.freq); if (diff < minDiff) { minDiff = diff; closestNote = note; } }); const tolerance = closestNote.freq * (Math.pow(2, 1/24) - 1); return minDiff < tolerance ? closestNote : null; }
+    function buildHarmonicaDisplay() { const rows = { blow_bends: [], blows: [], holes: [], draws: [], draw_bends: [] }; for (let i = 1; i <= 10; i++) { const h = harmonicaLayout.find(d => d.hole === i); rows.holes.push(`<div class="harmonica-cell hole-number">${i}</div>`); rows.blows.push(`<div class="harmonica-cell note blow" id="note-cell-${h.blow.midi}">${h.blow.name.slice(0,-1)}</div>`); rows.draws.push(`<div class="harmonica-cell note draw" id="note-cell-${h.draw.midi}">${h.draw.name.slice(0,-1)}</div>`); rows.blow_bends.push(`<div>${(h.blow_bends || []).map(b => `<div class="harmonica-cell note blow-bend" id="note-cell-${b.midi}">${b.name.slice(0,-1)}</div>`).join('') || '&nbsp;'}</div>`); rows.draw_bends.push(`<div class="bend-group">${(h.draw_bends || []).map(b => `<div class="harmonica-cell note draw-bend" id="note-cell-${b.midi}">${b.name.slice(0,-1)}</div>`).join('') || '&nbsp;'}</div>`); } id('harmonica-display').innerHTML = `<div class="harmonica-row">${rows.blow_bends.join('')}</div><div class="harmonica-row">${rows.blows.join('')}</div><div class="harmonica-row">${rows.holes.join('')}</div><div class="harmonica-row">${rows.draws.join('')}</div><div class="harmonica-row">${rows.draw_bends.join('')}</div>`; }
+    function updateVisuals(noteInfo, cents) { document.querySelectorAll('.active').forEach(el => el.classList.remove('active')); if (!noteInfo) { detectedNoteEl.textContent = '—'; detectedActionEl.textContent = '—'; updateTuner(0); return; } if(noteInfo.midi !== (lastDetectedNote && lastDetectedNote.midi)){ detectedNoteEl.textContent = noteInfo.name; detectedActionEl.textContent = `${noteInfo.hole} ${noteInfo.type.replace('-', ' ')}`; id(`note-cell-${noteInfo.midi}`)?.classList.add('active'); id('keyboard').querySelector(`[data-midi="${noteInfo.midi}"]`)?.classList.add('active'); } updateTuner(cents); }
+    function updateTuner(cents) { tunerCentsEl.textContent = cents.toFixed(1); const p = Math.max(-50, Math.min(50, cents)); tunerNeedle.style.transform = `translateX(${p}%)`; tunerNeedle.style.background = Math.abs(cents) < 5 ? '#43a047' : 'white'; }
+    function clearDetection() { if (!lastDetectedNote) return; lastDetectedNote = null; updateVisuals(null); noteOff(); }
+    async function toggleMic() { try { if (micRunning) { micRunning = false; if(micTimer) clearInterval(micTimer); micStream?.getTracks().forEach(t => t.stop()); btnMicToggle.textContent = '🎤 Start Listening'; } else { await audioCtx.resume(); micStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl: false}}); micAnalyser = audioCtx.createAnalyser(); micAnalyser.fftSize = FFT_SIZE; micBuffer = new Float32Array(micAnalyser.fftSize); audioCtx.createMediaStreamSource(micStream).connect(micAnalyser); micRunning = true; micTimer = setInterval(detect, 60); btnMicToggle.textContent = '🛑 Stop Listening'; } } catch(e) { alert("Mic access failed: " + e.message); } }
+    function buildKeyboard() { const names = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B']; for(let i=0; i<60; i++) { const m = 48 + i, n = names[m%12]; const k = document.createElement('div'); k.className = 'key' + (n.includes('b') ? ' black' : ''); k.textContent = n + Math.floor(m/12 - 1); k.dataset.midi = m; id('keyboard').appendChild(k); }}
+
+    buildHarmonicaDisplay();
+    buildKeyboard();
+    btnMicToggle.addEventListener('click', toggleMic);
+    soundToggle.addEventListener('change', (e) => { soundEnabled = e.target.checked; if (!soundEnabled) noteOff(); });
+  </script>
+</body>
+</html>
+
